@@ -1,0 +1,8 @@
+data/
+new_data/train/
+new_data/test/
+new_data/val/
+new_data/images/
+# OS
+.DS_Store
+HPC_GUIDE.md
