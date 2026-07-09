@@ -10,34 +10,7 @@ starts.
 Requirements:
     pip install --break-system-packages transformers>=4.49 accelerate peft \
         qwen-vl-utils pillow torch
-
-Data-construction decisions (see project notes / conversation history):
-  - Answerable items: use the answer page from
-    answers_page_bounding_boxes[0][0]["page"]. Items with no bounding box
-    (the "abstractive" answer_type) are DROPPED, not assigned a random
-    page -- picking a random page for these would train the model to
-    confidently state an answer on a page that may not support it, i.e.
-    actively teach hallucination. This is the opposite of the
-    not-answerable case, where any page is a valid "refuse" target.
-  - Not-answerable items: no page exists in the source data at all (no
-    answer -> no answer page). One page is sampled per question,
-    deterministically seeded per questionId (not always page 0), from
-    that doc's available pages per the patch-folder glob index.
-  - Balance: after dropping "abstractive" answerable items, answerable
-    count (~993) ends up well below not-answerable count (~1998).
-    Default here is to DOWNSAMPLE not-answerable down to match
-    answerable, restoring 1:1 -- safe, no new assumptions. If you'd
-    rather try to recover "abstractive" items via OCR text-search
-    matching (find which page's OCR actually contains the answer
-    string), that's a different, not-yet-implemented path -- ask if you
-    want it added.
-  - Coverage gaps (docIds with zero patch files) are dropped with a
-    printed count, not silently skipped.
-
-Prompt construction, OCR extraction/sorting, refusal phrase, and image
-min/max-pixel handling all come from prompt_utils.py (verbatim from
-evaluate_corrupted.py) -- do not reimplement any of that here.
-
+        
 Usage (single GPU, A40):
     python fine_tune.py \
         --annotations /path/to/annotations_balanced_train.json \
@@ -493,7 +466,7 @@ def main():
     ap.add_argument("--balance_mode", choices=["downsample_na", "none"], default="downsample_na")
     ap.add_argument("--no_ocr", action="store_true",
                      help="Train the no-OCR arm instead of the OCR arm.")
-    ap.add_argument("--num_epochs", type=int, default=2)
+    ap.add_argument("--num_epochs", type=int, default=10)
     ap.add_argument("--batch_size", type=int, default=1)
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-4)
@@ -560,7 +533,8 @@ def main():
         load_best_model_at_end=True,
         metric_for_best_model="eval_selection_score",
         greater_is_better=True,
-        report_to=[],
+        report_to=["tensorboard"],
+        logging_dir=str(output_dir / "tb_logs"),
         seed=args.seed,
         remove_unused_columns=False,
         gradient_checkpointing=True,
