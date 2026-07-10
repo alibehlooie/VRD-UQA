@@ -1,28 +1,3 @@
-#!/usr/bin/env python3
-"""
-Corrupted-question benchmark: evaluate a model on DUDE_verified.json (187 items).
-
-Replicates the paper's exact evaluation methodology:
-  - Tests ALL pages of each document (not just the answer page)
-  - AccP = average fraction of pages correctly answered per question
-  - AccD = fraction of questions where ALL pages are correctly answered
-  - Prompt: paper's Explicit condition ("Unable to determine")
-
-Usage:
-    # base model — verified 187-question subset (matches paper)
-    python evaluate_corrupted.py \
-        --data_file  /path/to/DUDE_verified.json \
-        --images_dir /path/to/images/train \
-        --output     corrupted_verified_results.json
-
-    # fine-tuned model
-    python evaluate_corrupted.py \
-        --data_file  /path/to/DUDE_verified.json \
-        --images_dir /path/to/images/train \
-        --model_dir  /path/to/finetuned_checkpoint \
-        --output     corrupted_verified_finetuned_results.json
-"""
-
 import os
 import json
 import argparse

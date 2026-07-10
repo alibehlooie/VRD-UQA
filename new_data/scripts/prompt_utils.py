@@ -1,30 +1,3 @@
-"""
-prompt_utils.py
-
-Single source of truth for prompt construction, OCR extraction/sorting,
-refusal detection, and image handling -- shared by fine_tune.py and
-evaluate_corrupted.py.
-
-AUTHORITATIVE SOURCE: build_prompt(), is_refusal(), REFUSAL_PHRASES,
-IMAGE_MIN_PIXELS/IMAGE_MAX_PIXELS, and the (y0, x0) sort convention are
-copied verbatim from evaluate_corrupted.py (the paper-methodology-locked
-eval script), NOT invented here. If you need to change wording, sort
-order, or the refusal phrase, change it here and evaluate_corrupted.py
-picks it up automatically -- do not fork a second copy.
-
-MAX_OCR_CHARS = 8000 (updated from the eval script's original 2000 to match
-training config, per decision on 2026-07-07 -- evaluate_corrupted.py has
-been updated to import this value rather than hardcode 2000).
-
-Two data sources need OCR extraction, with different schemas:
-  - Training side: per-page patch-json files (bbox/label/content_type/
-    text/caption/patch_image_path), one flat list per page.
-  - Eval side (DUDE_verified.json): embedded layout_analysis.pages, each
-    page a dict of objects with BBOX/ObjectType/ObjectTypeID/OCR (figure
-    captions already merged into the OCR field, no separate field).
-
-Both funnel into the same core sort+join so train and eval never diverge.
-"""
 from __future__ import annotations
 import json
 from pathlib import Path

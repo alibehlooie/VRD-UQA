@@ -1,23 +1,3 @@
-"""
-fine_tune.py
-
-LoRA SFT of Qwen2.5-VL-7B-Instruct for unanswerable-question detection on
-VRDs. Reads annotations_balanced_train.json + the patch-json folder
-directly -- no separate build_dataset.py / train.jsonl step. The join,
-page-assignment, and balancing logic run once in memory when training
-starts.
-
-Requirements:
-    pip install --break-system-packages transformers>=4.49 accelerate peft \
-        qwen-vl-utils pillow torch
-        
-Usage (single GPU, A40):
-    python fine_tune.py \
-        --annotations /path/to/annotations_balanced_train.json \
-        --patch_dir /path/to/patches/train \
-        --image_dir /path/to/images/train \
-        --output_dir /path/to/checkpoints
-"""
 import os
 import re
 import json
@@ -36,6 +16,7 @@ from transformers import (
     Trainer,
     EarlyStoppingCallback,
 )
+from transformers.trainer_utils import get_last_checkpoint
 
 try:
     from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLModel
@@ -94,10 +75,13 @@ def get_answer_page(item: dict):
     return boxes[0][0]["page"]
 
 
-def build_records(annotations_path: str, patch_dir: Path, seed: int,
-                   balance_mode: str = "downsample_na"):
+def build_and_balance_records(annotations_path: str, patch_dir: Path, seed: int,
+                               balance_mode: str = "downsample_na"):
     """
-    Returns (train_records, val_records, summary_dict).
+    Builds records from ONE annotations file (join + page assignment +
+    multi-page recovery + balance), with NO train/val split applied.
+    Returns (records, summary_dict).
+
     balance_mode:
       "downsample_na" -> randomly drop not-answerable records down to
                           match the answerable count (default, safe).
@@ -187,13 +171,30 @@ def build_records(annotations_path: str, patch_dir: Path, seed: int,
         "balance_mode": balance_mode,
     }
 
-    # Stratified train/val split, 5% val
-    def split(lst, frac=0.05):
+    balanced_records = ans_records + unans_records
+    rng.shuffle(balanced_records)
+    return balanced_records, summary
+
+
+def build_records(annotations_path: str, patch_dir: Path, seed: int,
+                   balance_mode: str = "downsample_na", val_fraction: float = 0.05):
+    """
+    Backward-compatible single-file path: builds from ONE annotations
+    file and carves off val_fraction internally. Only used when
+    --val_annotations is NOT provided. Prefer build_train_val_from_two_files
+    when you have a real held-out val file.
+    """
+    records, summary = build_and_balance_records(annotations_path, patch_dir, seed, balance_mode)
+    ans_records = [r for r in records if r["is_answerable"]]
+    unans_records = [r for r in records if not r["is_answerable"]]
+
+    def split(lst, frac):
         n_val = int(len(lst) * frac)
         return lst[n_val:], lst[:n_val]
 
-    ans_train, ans_val = split(ans_records)
-    unans_train, unans_val = split(unans_records)
+    rng = random.Random(seed)
+    ans_train, ans_val = split(ans_records, val_fraction)
+    unans_train, unans_val = split(unans_records, val_fraction)
 
     train_records = ans_train + unans_train
     val_records = ans_val + unans_val
@@ -201,6 +202,35 @@ def build_records(annotations_path: str, patch_dir: Path, seed: int,
     rng.shuffle(val_records)
 
     return train_records, val_records, summary
+
+
+def build_train_val_from_two_files(train_annotations_path: str, val_annotations_path: str,
+                                    train_patch_dir: Path, val_patch_dir: Path,
+                                    seed: int, balance_mode: str = "downsample_na"):
+    """
+    Preferred path when a real held-out val file (e.g.
+    annotations_balanced_val.json) is available: builds train and val
+    INDEPENDENTLY from their own files, each balanced on its own terms,
+    with no train/val split logic at all (all of train file -> train,
+    all of val file -> val). train and val may live under different
+    patch-json folders (e.g. patches/train/ vs patches/val/) -- the
+    coverage/join step uses each file's own patch_dir.
+    """
+    train_records, train_summary = build_and_balance_records(
+        train_annotations_path, train_patch_dir, seed, balance_mode)
+    val_records, val_summary = build_and_balance_records(
+        val_annotations_path, val_patch_dir, seed, balance_mode)
+
+    combined_summary = {
+        "train": train_summary,
+        "val": val_summary,
+        "balance_mode": balance_mode,
+        # kept for print_build_summary()'s existing single-summary shape
+        "dropped": train_summary["dropped"],
+        "pre_balance_counts": train_summary["pre_balance_counts"],
+        "post_balance_counts": train_summary["post_balance_counts"],
+    }
+    return train_records, val_records, combined_summary
 
 
 def print_build_summary(summary: dict, n_train: int, n_val: int, records: list = None):
@@ -460,8 +490,22 @@ def main():
     ap.add_argument("--model_id", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--annotations", required=True,
                      help="Path to annotations_balanced_train.json")
-    ap.add_argument("--patch_dir", required=True)
-    ap.add_argument("--image_dir", required=True)
+    ap.add_argument("--val_annotations", default=None,
+                     help="Path to a real held-out val file (e.g. "
+                          "annotations_balanced_val.json). If given, train "
+                          "uses 100%% of --annotations and val is built "
+                          "independently from this file (no internal split). "
+                          "If omitted, falls back to carving val_fraction off "
+                          "--annotations.")
+    ap.add_argument("--patch_dir", required=True, help="Train patch-json folder")
+    ap.add_argument("--image_dir", required=True, help="Train page-image folder")
+    ap.add_argument("--val_patch_dir", default=None,
+                     help="Val patch-json folder, if different from --patch_dir "
+                          "(e.g. a separate patches/val/ directory). Defaults to "
+                          "--patch_dir if not given.")
+    ap.add_argument("--val_image_dir", default=None,
+                     help="Val page-image folder, if different from --image_dir. "
+                          "Defaults to --image_dir if not given.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--balance_mode", choices=["downsample_na", "none"], default="downsample_na")
     ap.add_argument("--no_ocr", action="store_true",
@@ -484,10 +528,32 @@ def main():
     output_dir = Path(args.output_dir) / ocr_suffix
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    done_marker = output_dir / "TRAINING_COMPLETE"
+    if done_marker.exists():
+        print(f"{done_marker} already exists -- training already completed. Exiting (no-op).")
+        print("(This is expected if a chained successor job started after the run "
+              "already finished cleanly; the .sh script's cancel step should "
+              "normally prevent this from happening, but this is a safety net.)")
+        return
+
+    val_patch_dir = args.val_patch_dir or args.patch_dir
+    val_image_dir = args.val_image_dir or args.image_dir
+
     print(f"Building dataset from {args.annotations} + {args.patch_dir} ...")
-    train_records, val_records, summary = build_records(
-        args.annotations, Path(args.patch_dir), args.seed, balance_mode=args.balance_mode,
-    )
+    if args.val_annotations:
+        print(f"Using held-out val file: {args.val_annotations} (no internal split)")
+        print(f"Val patch_dir: {val_patch_dir}  Val image_dir: {val_image_dir}")
+        train_records, val_records, summary = build_train_val_from_two_files(
+            args.annotations, args.val_annotations,
+            Path(args.patch_dir), Path(val_patch_dir),
+            args.seed, balance_mode=args.balance_mode,
+        )
+    else:
+        print("No --val_annotations given -- carving 5% off --annotations for val "
+              "(pass --val_annotations to use a real held-out file instead).")
+        train_records, val_records, summary = build_records(
+            args.annotations, Path(args.patch_dir), args.seed, balance_mode=args.balance_mode,
+        )
     print_build_summary(summary, len(train_records), len(val_records), records=train_records + val_records)
 
     print(f"Loading processor/model: {args.model_id}")
@@ -515,7 +581,7 @@ def main():
     model.print_trainable_parameters()
 
     train_ds = VRDUQADataset(train_records, args.patch_dir, args.image_dir, processor, include_ocr=include_ocr)
-    val_ds = VRDUQADataset(val_records, args.patch_dir, args.image_dir, processor, include_ocr=include_ocr)
+    val_ds = VRDUQADataset(val_records, val_patch_dir, val_image_dir, processor, include_ocr=include_ocr)
     print(f"Train examples: {len(train_ds)}  Val examples: {len(val_ds)}")
 
     training_args = TrainingArguments(
@@ -550,7 +616,13 @@ def main():
         gen_subset_size=args.gen_subset_size,
     )
 
-    trainer.train()
+    resume_ckpt = get_last_checkpoint(str(output_dir))
+    if resume_ckpt:
+        print(f"Found existing checkpoint, resuming from: {resume_ckpt}")
+    else:
+        print("No existing checkpoint found -- starting fresh.")
+
+    trainer.train(resume_from_checkpoint=resume_ckpt)
 
     print(f"Multi-page examples skipped (train): {train_ds.multipage_skipped}")
     print(f"Multi-page examples skipped (val):   {val_ds.multipage_skipped}")
@@ -561,7 +633,9 @@ def main():
 
     trainer.save_model(str(output_dir / "best"))
     processor.save_pretrained(str(output_dir / "best"))
+    done_marker.touch()
     print(f"Done. Best model saved to {output_dir / 'best'}")
+    print(f"Wrote completion marker: {done_marker}")
 
 
 if __name__ == "__main__":
