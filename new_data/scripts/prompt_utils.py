@@ -134,13 +134,44 @@ def extract_ocr_from_layout_analysis(item: dict, page_id: str, max_chars: int = 
 # ---------------------------------------------------------------------------
 # Image loading (matches evaluate_corrupted.py's resize-if-over-max logic)
 # ---------------------------------------------------------------------------
+_PATCH_FACTOR = 28  # Qwen2.5-VL vision patch size; dimensions must be multiples of this
+
+
 def load_and_resize_image(path: Union[str, Path]) -> Image.Image:
+    """
+    Resize to satisfy BOTH IMAGE_MAX_PIXELS and IMAGE_MIN_PIXELS, with
+    dimensions rounded to multiples of the patch size (28) -- mirrors
+    Qwen2.5-VL's own smart_resize logic.
+
+    The original version of this function (copied from
+    evaluate_corrupted.py) only capped the MAXIMUM size and never enforced
+    a minimum or patch-size rounding. For naturally small page images,
+    that meant no upscaling ever happened, and Qwen2.5-VL's vision merger
+    (which groups patches in blocks of 4) could end up with fewer than 4
+    total patches for the whole image, crashing with a reshape error
+    ("shape '[0, 4, -1]' is invalid ...") deep inside the model forward
+    pass -- not something a dataset-level try/except can catch, since the
+    tensors are valid, just too small. This version fixes that for both
+    training and eval.
+    """
     image = Image.open(path).convert("RGB")
-    if image.width * image.height > IMAGE_MAX_PIXELS:
-        scale = (IMAGE_MAX_PIXELS / (image.width * image.height)) ** 0.5
-        image = image.resize(
-            (int(image.width * scale), int(image.height * scale)), Image.LANCZOS,
-        )
+    w, h = image.width, image.height
+
+    h_bar = max(_PATCH_FACTOR, round(h / _PATCH_FACTOR) * _PATCH_FACTOR)
+    w_bar = max(_PATCH_FACTOR, round(w / _PATCH_FACTOR) * _PATCH_FACTOR)
+    area = h_bar * w_bar
+
+    if area > IMAGE_MAX_PIXELS:
+        beta = (h * w / IMAGE_MAX_PIXELS) ** 0.5
+        h_bar = max(_PATCH_FACTOR, int(h / beta // _PATCH_FACTOR) * _PATCH_FACTOR)
+        w_bar = max(_PATCH_FACTOR, int(w / beta // _PATCH_FACTOR) * _PATCH_FACTOR)
+    elif area < IMAGE_MIN_PIXELS:
+        beta = (IMAGE_MIN_PIXELS / (h * w)) ** 0.5
+        h_bar = -(-int(h * beta) // _PATCH_FACTOR) * _PATCH_FACTOR  # ceil to multiple
+        w_bar = -(-int(w * beta) // _PATCH_FACTOR) * _PATCH_FACTOR
+
+    if (h_bar, w_bar) != (h, w):
+        image = image.resize((w_bar, h_bar), Image.LANCZOS)
     return image
 
 

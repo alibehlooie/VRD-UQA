@@ -380,11 +380,29 @@ class SingleExampleCollator:
 # LoRA target module discovery
 # ---------------------------------------------------------------------------
 def find_all_linear_names(model):
+    """
+    Collects nn.Linear leaf names for LoRA's target_modules. PEFT matches
+    target_modules by simple string suffix (key.endswith(target)), so a
+    bare numeric leaf name (e.g. "0") can spuriously match a whole
+    ModuleList block sharing that index (e.g. "visual.blocks.0", the
+    vision transformer block itself, not a Linear layer) -- this crashed
+    with "Target module Qwen2_5_VLVisionBlock(...) is not supported".
+    Cause: Qwen2.5-VL's vision merger MLP is an nn.Sequential, whose
+    Linear layers get purely numeric leaf names ("0", "2", ...) instead
+    of names like "gate_proj". Fix: qualify numeric leaf names with their
+    parent name (e.g. "mlp.0") so they only match the intended
+    Sequential-indexed Linear, not any block sharing that index.
+    """
     names = set()
     for name, module in model.named_modules():
         if isinstance(module, torch.nn.Linear):
-            leaf = name.split(".")[-1]
-            if leaf != "lm_head":
+            parts = name.split(".")
+            leaf = parts[-1]
+            if leaf == "lm_head":
+                continue
+            if leaf.isdigit() and len(parts) >= 2:
+                names.add(f"{parts[-2]}.{leaf}")
+            else:
                 names.add(leaf)
     return sorted(names)
 
