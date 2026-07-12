@@ -1,6 +1,8 @@
 import os
 import re
 import json
+import math
+import time
 import random
 import argparse
 from pathlib import Path
@@ -16,7 +18,7 @@ from transformers import (
     Trainer,
     EarlyStoppingCallback,
 )
-from transformers.trainer_utils import get_last_checkpoint
+from transformers.trainer_utils import get_last_checkpoint, speed_metrics
 
 try:
     from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLModel
@@ -36,12 +38,12 @@ from prompt_utils import (
     page_image_path,
     load_and_resize_image,
     build_messages,
-    build_messages_multi,
     build_target,
     is_refusal,
 )
 
 MAX_SEQ_LENGTH = 8192  # separate from MAX_OCR_CHARS; tokenized-sequence cap
+MERGE_SIZE = 2  # Qwen2.5-VL vision merger spatial group size (2x2 patches -> 1 merged token)
 PATCH_NAME_RE = re.compile(r"^([0-9a-f]{32})_(\d+)\.json$")
 
 
@@ -109,30 +111,15 @@ def build_and_balance_records(annotations_path: str, patch_dir: Path, seed: int,
         if is_answerable:
             page = get_answer_page(item)
             if page is None:
-                # No page bbox (e.g. "abstractive" answer_type). Recovered
-                # as a multi-page example over ALL of the doc's available
-                # pages -- no cap, per decision on 2026-07-07. Long
-                # documents may fail to encode at train time (see
-                # VRDUQADataset._build_example's try/except); such
-                # examples are skipped with a warning rather than crashing
-                # the run, not silently truncated to fewer pages.
-                if not available_pages:
-                    dropped["answerable_missing_page"] += 1
-                    continue
-                answer = item["answers"][0] if item.get("answers") else None
-                if not answer:
-                    dropped["answerable_missing_page"] += 1
-                    continue
-                records.append({
-                    "example_id": question_id,
-                    "doc_id": doc_id,
-                    "page": sorted(available_pages),
-                    "is_multipage": True,
-                    "question": item["question"],
-                    "answer": answer,
-                    "is_answerable": True,
-                    "answer_type": item["answer_type"],
-                })
+                # No page bbox (e.g. "abstractive" answer_type). Previously
+                # recovered as an unbounded multi-page example; reverted
+                # 2026-07-XX because concatenating many page images into
+                # one prompt triggered a Qwen2.5-VL windowed-attention
+                # crash (RuntimeError: reshape invalid for spatial_merge_unit)
+                # that a per-image patch-count pre-check couldn't fully
+                # predict. Back to dropping these, matching the original
+                # working single-image-per-example approach.
+                dropped["answerable_missing_page"] += 1
                 continue
             if page not in available_pages:
                 dropped["answer_page_not_in_patch_index"] += 1
@@ -240,9 +227,6 @@ def print_build_summary(summary: dict, n_train: int, n_val: int, records: list =
     print(f"Post-balance: answerable={summary['post_balance_counts']['answerable']}  "
           f"not_answerable={summary['post_balance_counts']['not_answerable']}  "
           f"(mode={summary['balance_mode']})")
-    if records is not None:
-        n_multi = sum(1 for r in records if r.get("is_multipage"))
-        print(f"Multi-page (recovered abstractive) records: {n_multi}")
     if summary["dropped"]:
         print("Dropped:")
         for reason, count in summary["dropped"].items():
@@ -268,40 +252,14 @@ class VRDUQADataset(Dataset):
         self.image_dir = Path(image_dir)
         self.processor = processor
         self.include_ocr = include_ocr
-        self.multipage_skipped = 0
-        self.multipage_skipped_ids = []
+        self.skipped_total = 0
+        self.skipped_ids = []
 
     def __len__(self):
         return len(self.records)
 
     def _build_example(self, record):
         doc_id = record["doc_id"]
-        is_multipage = record.get("is_multipage", False)
-
-        if is_multipage:
-            pages = record["page"]  # list of ints
-            images, ocr_pieces = [], []
-            for page in pages:
-                img_path = page_image_path(self.image_dir, doc_id, page)
-                images.append(load_and_resize_image(img_path))
-                if self.include_ocr:
-                    patch_path = patch_file_path(self.patch_dir, doc_id, page)
-                    if patch_path.exists():
-                        patches = load_patch_file(patch_path)
-                        page_text = extract_ocr_from_patch_file(patches, max_chars=MAX_OCR_CHARS)
-                        if page_text:
-                            ocr_pieces.append(f"[Page {page}]\n{page_text}")
-            # Cap applied once over the WHOLE joined multi-page text (not
-            # per-page) -- this is a training-only convention for the
-            # recovered abstractive items; the eval side never hits this
-            # path since DUDE_verified is always single-page.
-            ocr_text = "\n\n".join(ocr_pieces)
-            if len(ocr_text) > MAX_OCR_CHARS:
-                ocr_text = ocr_text[:MAX_OCR_CHARS]
-            messages = build_messages_multi(images=images, question=record["question"], ocr_text=ocr_text)
-            target = build_target(record.get("answer"), record["is_answerable"])
-            return messages, target, images
-
         page = record["page"]
         img_path = page_image_path(self.image_dir, doc_id, page)
 
@@ -322,20 +280,20 @@ class VRDUQADataset(Dataset):
         try:
             return self._encode(record)
         except Exception as e:
-            if record.get("is_multipage"):
-                # Safety net (not a cap): a long multi-page example failed
-                # to encode (sequence too long / OOM / image-token
-                # misalignment after truncation). Skip it rather than
-                # crash the run, and fall back to the next example.
-                self.multipage_skipped += 1
-                self.multipage_skipped_ids.append(record["example_id"])
-                print(f"WARNING: skipping multi-page example {record['example_id']} "
-                      f"({len(record['page'])} pages) -- encode failed: {e}")
-                fallback_idx = (idx + 1) % len(self.records)
-                if fallback_idx == idx:
-                    raise
-                return self.__getitem__(fallback_idx)
-            raise
+            # Safety net (not a cap): the example failed to encode --
+            # either a long multi-page example too big for MAX_SEQ_LENGTH,
+            # OOM, or a degenerate image (see the image_grid_thw check in
+            # _encode). Skip it and fall back to the next example rather
+            # than crashing the whole run.
+            self.skipped_total += 1
+            self.skipped_ids.append(record["example_id"])
+            print(f"WARNING: skipping example {record['example_id']} "
+                  f"(doc_id={record['doc_id']} page={record.get('page')}) "
+                  f"-- encode failed: {e}")
+            fallback_idx = (idx + 1) % len(self.records)
+            if fallback_idx == idx:
+                raise
+            return self.__getitem__(fallback_idx)
 
     def _encode(self, record):
         messages, target, image_or_images = self._build_example(record)
@@ -355,6 +313,23 @@ class VRDUQADataset(Dataset):
             text=[full_text], images=image_inputs, return_tensors="pt",
             truncation=True, max_length=MAX_SEQ_LENGTH,
         )
+
+        # Proactive check: Qwen2.5-VL's vision merger groups patches in
+        # blocks of SPATIAL_MERGE_UNIT (4) via a 2D (h,w) spatial grouping --
+        # NOT just total patch count divisible by 4. A lopsided grid like
+        # (t=1,h=1,w=4) has total=4 (passes a naive total%4==0 check) but
+        # h=1 can't be split into 2-row groups, and still crashes deep in
+        # model.forward(). Check h and w individually divisible by
+        # MERGE_SIZE instead.
+        if "image_grid_thw" in full_enc:
+            for grid in full_enc["image_grid_thw"]:
+                t, h, w = (int(x) for x in grid.tolist())
+                if h % MERGE_SIZE != 0 or w % MERGE_SIZE != 0 or h < MERGE_SIZE or w < MERGE_SIZE:
+                    raise ValueError(
+                        f"Degenerate image grid (t={t},h={h},w={w}) -- h and w must "
+                        f"each be >= and divisible by MERGE_SIZE={MERGE_SIZE} "
+                        f"for doc_id={record['doc_id']} page={record.get('page')}"
+                    )
 
         input_ids = full_enc["input_ids"][0]
         labels = input_ids.clone()
@@ -445,20 +420,97 @@ def compute_binary_classification_metrics(preds_refused, trues_refused):
 class VRDUQATrainer(Trainer):
     """Overrides evaluate() to run real generation and merge macro_f1 /
     ans_acc / unans_acc / selection_score into the metrics dict BEFORE
-    Trainer's best-model / early-stopping logic consumes it."""
+    Trainer's best-model / early-stopping logic consumes it. Also
+    overrides training_step() as a last-resort safety net: the
+    image_grid_thw check in VRDUQADataset._encode() catches the obvious
+    single-image "too few patches" case, but Qwen2.5-VL's windowed
+    attention has more complex constraints across CONCATENATED multi-page
+    images that a simple per-image patch-count check can't fully predict.
+    If a batch still fails deep inside model.forward() despite passing
+    that check, this catches it here, logs which step, and skips the
+    batch (zero contribution, no crash) instead of losing the whole run."""
 
     def __init__(self, *args, gen_max_new_tokens=64, gen_subset_size=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.gen_max_new_tokens = gen_max_new_tokens
         self.gen_subset_size = gen_subset_size
+        self.degenerate_batches_skipped = 0
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        try:
+            return super().training_step(model, inputs, num_items_in_batch)
+        except RuntimeError as e:
+            if "is invalid for input of size" in str(e) or "spatial_merge_unit" in str(e):
+                self.degenerate_batches_skipped += 1
+                print(f"WARNING: skipping training step {self.state.global_step} -- "
+                      f"degenerate image batch made it past the pre-check "
+                      f"(total skipped so far: {self.degenerate_batches_skipped}): {e}")
+                model.zero_grad(set_to_none=True)
+                return torch.tensor(0.0, device=self.args.device)
+            raise
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Same crash class as training_step, but this is what HF's own
+        # evaluation_loop calls internally during super().evaluate() below
+        # -- the __getitem__/_encode-level pre-check can pass (the item
+        # "encoded fine") and the crash still only surfaces once the
+        # actual forward pass runs, same as training. Mirror the same
+        # catch-and-skip here so eval doesn't lose the whole run either.
+        try:
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
+        except RuntimeError as e:
+            if "is invalid for input of size" in str(e) or "spatial_merge_unit" in str(e):
+                self.degenerate_batches_skipped += 1
+                print(f"WARNING: skipping eval prediction step -- degenerate image batch "
+                      f"(total skipped so far: {self.degenerate_batches_skipped}): {e}")
+                return (None, None, None)
+            raise
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        output = super().evaluate(eval_dataset, ignore_keys, metric_key_prefix)
-        ds = eval_dataset if eval_dataset is not None else self.eval_dataset
-        gen_metrics = self._run_generation_eval(ds, metric_key_prefix)
-        output.update(gen_metrics)
-        self.log(gen_metrics)
-        return output
+        """
+        Deliberately does NOT call super().evaluate() -- that high-level
+        wrapper internally fires callback_handler.on_evaluate() (which is
+        what EarlyStoppingCallback listens to) BEFORE returning control
+        back here, using only the base eval_loss-style metrics. Our
+        generation-based eval_selection_score would then be merged in too
+        late for EarlyStoppingCallback to ever see it on its one look per
+        round -- exactly the "early stopping required metric_for_best_model,
+        but did not find eval_selection_score" warning, every epoch.
+
+        Checkpoint-saving (load_best_model_at_end) was unaffected by that
+        bug since it re-reads whatever this method eventually returns, but
+        early stopping specifically needs the callback fired with the
+        FULL metrics dict, which means computing everything first and
+        only then triggering logging/callbacks ourselves.
+        """
+        eval_dataset_to_use = eval_dataset if eval_dataset is not None else self.eval_dataset
+        eval_dataloader = self.get_eval_dataloader(eval_dataset_to_use)
+        start_time = time.time()
+
+        output = self.evaluation_loop(
+            eval_dataloader,
+            description="Evaluation",
+            prediction_loss_only=True if self.compute_metrics is None else None,
+            ignore_keys=ignore_keys,
+            metric_key_prefix=metric_key_prefix,
+        )
+        total_batch_size = self.args.eval_batch_size * self.args.world_size
+        output.metrics.update(
+            speed_metrics(
+                metric_key_prefix, start_time,
+                num_samples=output.num_samples,
+                num_steps=math.ceil(output.num_samples / total_batch_size),
+            )
+        )
+        metrics = dict(output.metrics)
+
+        gen_metrics = self._run_generation_eval(eval_dataset_to_use, metric_key_prefix)
+        metrics.update(gen_metrics)
+
+        self.log(metrics)
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+        self._memory_tracker.stop_and_update_metrics(metrics)
+        return metrics
 
     @torch.no_grad()
     def _run_generation_eval(self, dataset: VRDUQADataset, prefix: str):
@@ -469,26 +521,46 @@ class VRDUQATrainer(Trainer):
             records = rng.sample(records, self.gen_subset_size)
 
         preds_refused, trues_refused = [], []
+        gen_eval_skipped = 0
         for record in records:
-            messages, _, _ = dataset._build_example(record)
-            prompt_text = dataset.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            image_inputs, _ = process_vision_info(messages)
-            inputs = dataset.processor(
-                text=[prompt_text], images=image_inputs, return_tensors="pt",
-                truncation=True, max_length=MAX_SEQ_LENGTH,
-            ).to(self.model.device)
+            try:
+                messages, _, _ = dataset._build_example(record)
+                prompt_text = dataset.processor.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+                image_inputs, _ = process_vision_info(messages)
+                inputs = dataset.processor(
+                    text=[prompt_text], images=image_inputs, return_tensors="pt",
+                    truncation=True, max_length=MAX_SEQ_LENGTH,
+                ).to(self.model.device)
 
-            gen_ids = self.model.generate(
-                **inputs, max_new_tokens=self.gen_max_new_tokens, do_sample=False,
-            )
-            gen_text = dataset.processor.tokenizer.decode(
-                gen_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
-            )
+                if "image_grid_thw" in inputs:
+                    for grid in inputs["image_grid_thw"]:
+                        t, h, w = (int(x) for x in grid.tolist())
+                        if h % MERGE_SIZE != 0 or w % MERGE_SIZE != 0 or h < MERGE_SIZE or w < MERGE_SIZE:
+                            raise ValueError(
+                                f"Degenerate image grid (t={t},h={h},w={w}) "
+                                f"for doc_id={record['doc_id']}"
+                            )
+
+                gen_ids = self.model.generate(
+                    **inputs, max_new_tokens=self.gen_max_new_tokens, do_sample=False,
+                )
+                gen_text = dataset.processor.tokenizer.decode(
+                    gen_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+                )
+            except Exception as e:
+                gen_eval_skipped += 1
+                print(f"WARNING: skipping generation-eval example {record['example_id']} "
+                      f"-- failed: {e}")
+                continue
 
             preds_refused.append(is_refusal(gen_text))
             trues_refused.append(not record["is_answerable"])
+
+        if gen_eval_skipped:
+            print(f"Generation eval: skipped {gen_eval_skipped}/{len(records)} examples")
+
 
         metrics = compute_binary_classification_metrics(preds_refused, trues_refused)
         selection_score = metrics["macro_f1"] - 0.5 * max(
@@ -642,12 +714,14 @@ def main():
 
     trainer.train(resume_from_checkpoint=resume_ckpt)
 
-    print(f"Multi-page examples skipped (train): {train_ds.multipage_skipped}")
-    print(f"Multi-page examples skipped (val):   {val_ds.multipage_skipped}")
-    if train_ds.multipage_skipped_ids:
-        print(f"  skipped train example_ids: {train_ds.multipage_skipped_ids}")
-    if val_ds.multipage_skipped_ids:
-        print(f"  skipped val example_ids:   {val_ds.multipage_skipped_ids}")
+    print(f"Total examples skipped (train): {train_ds.skipped_total}")
+    print(f"Total examples skipped (val):   {val_ds.skipped_total}")
+    print(f"Degenerate training batches skipped (caught at model.forward): "
+          f"{trainer.degenerate_batches_skipped}")
+    if train_ds.skipped_ids:
+        print(f"  skipped train example_ids: {train_ds.skipped_ids}")
+    if val_ds.skipped_ids:
+        print(f"  skipped val example_ids:   {val_ds.skipped_ids}")
 
     trainer.save_model(str(output_dir / "best"))
     processor.save_pretrained(str(output_dir / "best"))
