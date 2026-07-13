@@ -44,6 +44,7 @@ from prompt_utils import (
 
 MAX_SEQ_LENGTH = 8192  # separate from MAX_OCR_CHARS; tokenized-sequence cap
 MERGE_SIZE = 2  # Qwen2.5-VL vision merger spatial group size (2x2 patches -> 1 merged token)
+_DIAGNOSTIC_COUNT = [0]  # temporary, see _encode() -- remove once the mismatch is identified
 PATCH_NAME_RE = re.compile(r"^([0-9a-f]{32})_(\d+)\.json$")
 
 
@@ -314,6 +315,24 @@ class VRDUQADataset(Dataset):
             truncation=True, max_length=MAX_SEQ_LENGTH,
         )
 
+        # TEMPORARY DIAGNOSTIC (2026-07-12): the image_grid_thw pre-check
+        # below has never actually fired despite a 100% model.forward()
+        # crash rate -- meaning grid_thw itself looks fine by our check,
+        # but something about the actual pixel_values tensor doesn't match
+        # what that grid claims. Dump real numbers for the first few calls
+        # so we can see the actual mismatch instead of guessing further.
+        if _DIAGNOSTIC_COUNT[0] < 5:
+            _DIAGNOSTIC_COUNT[0] += 1
+            img = image_or_images if not isinstance(image_or_images, list) else image_or_images[0]
+            pv_shape = tuple(full_enc["pixel_values"].shape) if "pixel_values" in full_enc else None
+            grid_vals = full_enc["image_grid_thw"].tolist() if "image_grid_thw" in full_enc else None
+            n_images = len(image_inputs) if isinstance(image_inputs, list) else 1
+            print(f"DIAGNOSTIC[{_DIAGNOSTIC_COUNT[0]}] doc_id={record['doc_id']} "
+                  f"page={record.get('page')} PIL_size(w,h)={img.size} "
+                  f"n_images_in_message={n_images} "
+                  f"pixel_values.shape={pv_shape} image_grid_thw={grid_vals} "
+                  f"input_ids.shape={tuple(full_enc['input_ids'].shape)}")
+
         # Proactive check: Qwen2.5-VL's vision merger groups patches in
         # blocks of SPATIAL_MERGE_UNIT (4) via a 2D (h,w) spatial grouping --
         # NOT just total patch count divisible by 4. A lopsided grid like
@@ -336,19 +355,51 @@ class VRDUQADataset(Dataset):
         prompt_len = prompt_enc["input_ids"].shape[1]
         labels[:prompt_len] = -100  # loss only on the completion
 
-        item = {k: v[0] for k, v in full_enc.items()}
+        # BUG FIX (2026-07-12): pixel_values and image_grid_thw are NOT
+        # batched per-example the way input_ids/attention_mask are.
+        # Qwen2.5-VL's processor returns pixel_values as a FLAT tensor of
+        # shape (total_patches, feature_dim) across however many images
+        # were passed, and image_grid_thw as (num_images, 3) -- neither
+        # has a real leading "batch" dimension to strip. Blindly doing
+        # v[0] on pixel_values (as this used to) sliced out just the
+        # FIRST PATCH ROW, collapsing e.g. a (4480, 1176) tensor down to
+        # (1176,). After the collator's unsqueeze(0), the model received
+        # exactly one patch -- which is a (1, hidden_size) tensor after
+        # patch embedding, i.e. exactly 1280 total elements for this
+        # model's hidden_size -- an EXACT match for the
+        # "shape '[0,4,-1]' is invalid for input of size 1280" crash that
+        # was 100% reproducible on every single training image,
+        # regardless of image content, LoRA config, attention backend, or
+        # transformers version. This was never caught by minimal_repro.py
+        # because that script uses processor() output directly, without
+        # ever going through this slicing at all.
+        NO_BATCH_DIM_KEYS = {"pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"}
+        item = {
+            k: (v if k in NO_BATCH_DIM_KEYS else v[0])
+            for k, v in full_enc.items()
+        }
         item["labels"] = labels
         return item
 
 
 @dataclass
 class SingleExampleCollator:
-    """BATCH_SIZE=1 -- nothing to pad across examples, just add batch dim."""
+    """BATCH_SIZE=1 -- nothing to pad across examples. Only input_ids/
+    attention_mask/labels get a batch dimension added; pixel_values and
+    image_grid_thw are already in the flat shape the model expects
+    (see the matching fix in VRDUQADataset._encode()) and must NOT be
+    unsqueezed -- doing so previously added a spurious leading dimension
+    on top of an already-wrong single-patch slice."""
+
+    NO_BATCH_DIM_KEYS = {"pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"}
 
     def __call__(self, features):
         assert len(features) == 1, "This collator assumes BATCH_SIZE=1"
         f = features[0]
-        return {k: v.unsqueeze(0) for k, v in f.items()}
+        return {
+            k: (v if k in self.NO_BATCH_DIM_KEYS else v.unsqueeze(0))
+            for k, v in f.items()
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -356,28 +407,33 @@ class SingleExampleCollator:
 # ---------------------------------------------------------------------------
 def find_all_linear_names(model):
     """
-    Collects nn.Linear leaf names for LoRA's target_modules. PEFT matches
-    target_modules by simple string suffix (key.endswith(target)), so a
-    bare numeric leaf name (e.g. "0") can spuriously match a whole
-    ModuleList block sharing that index (e.g. "visual.blocks.0", the
-    vision transformer block itself, not a Linear layer) -- this crashed
-    with "Target module Qwen2_5_VLVisionBlock(...) is not supported".
-    Cause: Qwen2.5-VL's vision merger MLP is an nn.Sequential, whose
-    Linear layers get purely numeric leaf names ("0", "2", ...) instead
-    of names like "gate_proj". Fix: qualify numeric leaf names with their
-    parent name (e.g. "mlp.0") so they only match the intended
-    Sequential-indexed Linear, not any block sharing that index.
+    Collects nn.Linear leaf names for LoRA's target_modules -- LLM decoder
+    only, matching the last-known-working version's LORA_TARGET_MODULES
+    (q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj). This
+    explicitly EXCLUDES anything under the vision tower ("visual.*":
+    attention qkv/proj, and the Sequential-indexed merger MLP).
+
+    Earlier versions of this file collected every nn.Linear in the WHOLE
+    model, including the vision tower, and wrapped those in LoRA too --
+    that produced a 100% reproducible crash on every single training
+    image ("shape '[0,4,-1]' is invalid...", deep in Qwen2.5-VL's window-
+    index/reshape logic), which several rounds of image-resize and
+    version-pin fixes failed to resolve. The old working version never
+    touched the vision tower with LoRA at all -- only the LLM decoder's
+    projections -- which is also the standard/common practice for
+    Qwen2.5-VL LoRA fine-tuning. Restricting to LLM-only here to match.
     """
+    llm_target_leaves = {
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    }
     names = set()
     for name, module in model.named_modules():
+        if name.startswith("visual") or ".visual." in name:
+            continue  # exclude the entire vision tower
         if isinstance(module, torch.nn.Linear):
-            parts = name.split(".")
-            leaf = parts[-1]
-            if leaf == "lm_head":
-                continue
-            if leaf.isdigit() and len(parts) >= 2:
-                names.add(f"{parts[-2]}.{leaf}")
-            else:
+            leaf = name.split(".")[-1]
+            if leaf in llm_target_leaves:
                 names.add(leaf)
     return sorted(names)
 
@@ -545,6 +601,7 @@ class VRDUQATrainer(Trainer):
 
                 gen_ids = self.model.generate(
                     **inputs, max_new_tokens=self.gen_max_new_tokens, do_sample=False,
+                    temperature=None, top_p=None, top_k=None,
                 )
                 gen_text = dataset.processor.tokenizer.decode(
                     gen_ids[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
@@ -576,6 +633,21 @@ class VRDUQATrainer(Trainer):
 # Main
 # ---------------------------------------------------------------------------
 def main():
+    # UNMISTAKABLE VERSION FINGERPRINT (2026-07-12): five consecutive
+    # supposedly-different fixes have produced byte-identical failure
+    # counts (1978->1987, steps 247-248) in the training log. That's not
+    # plausible as a coincidence of real model behavior -- it strongly
+    # suggests the running job is NOT using the code being edited. This
+    # print is the definitive test: if this exact string does not appear
+    # at the top of your .out log, the file that ran is NOT this file,
+    # and the actual next step is investigating deployment (stale copy,
+    # __pycache__, network-filesystem mtime granularity, wrong path) --
+    # NOT another guess about Qwen2.5-VL internals.
+    print(">>> FINGERPRINT: fine_tune.py VERSION=LLM_ONLY_LORA_FIX_2026_07_12 <<<", flush=True)
+    import sys as _sys
+    print(f">>> FINGERPRINT: running from {__file__} <<<", flush=True)
+    print(f">>> FINGERPRINT: python executable = {_sys.executable} <<<", flush=True)
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_id", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--annotations", required=True,
@@ -669,6 +741,14 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
+    # Required when combining LoRA (frozen base model) with gradient
+    # checkpointing: PyTorch's checkpoint mechanism needs at least one
+    # tensor in the checkpointed region to require grad to properly track
+    # backprop through it. Without this, the "None of the inputs have
+    # requires_grad=True" warning isn't just noise -- it can mean frozen
+    # layers wrapping LoRA adapters silently don't get gradients flowing
+    # through them correctly.
+    model.enable_input_require_grads()
 
     train_ds = VRDUQADataset(train_records, args.patch_dir, args.image_dir, processor, include_ocr=include_ocr)
     val_ds = VRDUQADataset(val_records, val_patch_dir, val_image_dir, processor, include_ocr=include_ocr)

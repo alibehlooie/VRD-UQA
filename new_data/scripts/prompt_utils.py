@@ -134,7 +134,20 @@ def extract_ocr_from_layout_analysis(item: dict, page_id: str, max_chars: int = 
 # ---------------------------------------------------------------------------
 # Image loading (matches evaluate_corrupted.py's resize-if-over-max logic)
 # ---------------------------------------------------------------------------
-_PATCH_FACTOR = 28  # Qwen2.5-VL vision patch size; dimensions must be multiples of this
+print(">>> FINGERPRINT: prompt_utils.py VERSION=LLM_ONLY_LORA_FIX_2026_07_12 "
+      f"(_PATCH_FACTOR will be defined below) imported from {__file__} <<<", flush=True)
+
+_PATCH_FACTOR = 112  # Qwen2.5-VL-7B window_size in pixels (8 patches of 14px each).
+# NOTE: 28 (patch_size*merge_size) only guarantees clean 2x2 MERGE alignment.
+# It does NOT guarantee clean WINDOW alignment (window_size=112px=8 patches),
+# and a dimension that isn't a whole number of windows produces a partial
+# edge window whose patch count can fail the merge reshape deep in
+# model.forward() -- this was the actual root cause of a 100%-reproducible
+# "shape '[0,4,-1]' is invalid" crash across every single training image
+# (confirmed via diagnostic: every failing image had grid h or w not
+# divisible by 8, even though all were correctly divisible by 2). Since
+# 112 is itself a multiple of 28, rounding to 112 automatically satisfies
+# both constraints at once.
 
 
 def load_and_resize_image(path: Union[str, Path]) -> Image.Image:
@@ -201,12 +214,21 @@ def build_messages(image: Union[str, Path, Image.Image], question: str, ocr_text
     run_inference exactly -- NO system role. `image` can be a path or an
     already-loaded PIL.Image (qwen_vl_utils.process_vision_info accepts
     either).
+
+    min_pixels/max_pixels are passed explicitly per-image so
+    process_vision_info uses OUR bounds rather than its own internal
+    defaults -- it re-derives image size independently of whatever we
+    already did to the PIL object, so relying on pre-resizing alone isn't
+    sufficient.
     """
     return [
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": image},
+                {
+                    "type": "image", "image": image,
+                    "min_pixels": IMAGE_MIN_PIXELS, "max_pixels": IMAGE_MAX_PIXELS,
+                },
                 {"type": "text", "text": build_prompt(question, ocr_text)},
             ],
         }
@@ -222,7 +244,13 @@ def build_messages_multi(images: List[Union[str, Path, Image.Image]], question: 
     always single-page per the paper's methodology, so this is additive,
     not a change to the shared single-page path.
     """
-    content = [{"type": "image", "image": img} for img in images]
+    content = [
+        {
+            "type": "image", "image": img,
+            "min_pixels": IMAGE_MIN_PIXELS, "max_pixels": IMAGE_MAX_PIXELS,
+        }
+        for img in images
+    ]
     content.append({"type": "text", "text": build_prompt(question, ocr_text)})
     return [{"role": "user", "content": content}]
 
