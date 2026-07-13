@@ -67,6 +67,29 @@ def main():
 
     print()
     print("=" * 78)
+    print("UNANSWERABLE-DETECTION METRICS (this benchmark is 100% unanswerable")
+    print("items -- there is no answerable subset here to compare against; for")
+    print("an answerable-vs-unanswerable comparison, see the training run's")
+    print("val-set eval_ans_acc / eval_unans_acc / eval_macro_f1 instead, which")
+    print("come from a genuinely mixed val set, not this file.)")
+    print("=" * 78)
+    zs_ua = zs["metrics"]["unanswerable"]
+    ft_ua = ft["metrics"]["unanswerable"]
+    print(f"{'':14} {'Zero-shot':>10} {'Fine-tuned':>10}")
+    print(f"{'F1':14} {fmt(zs_ua['f1'], 10)} {fmt(ft_ua['f1'], 10)}")
+    print(f"{'Recall (=AccD)':14} {fmt(zs_ua['recall'], 10)} {fmt(ft_ua['recall'], 10)}")
+    print(f"{'Precision':14} {fmt(zs_ua['precision'], 10)} {fmt(ft_ua['precision'], 10)}"
+          f"   (NOTE: trivially ~1.0 whenever TP>0 -- fp is hardcoded 0 in this")
+    print(f"{'':14} {'':>10} {'':>10}"
+          f"   benchmark since every item is truly unanswerable. Not a meaningful")
+    print(f"{'':14} {'':>10} {'':>10}"
+          f"   discriminator here -- recall/AccD is what actually matters.)")
+    print(f"{'TP / FN':14} {zs_ua['tp']:>10} / {zs_ua['fn']:<8} "
+          f"{ft_ua['tp']:>10} / {ft_ua['fn']}")
+    print(f"{'Support (n)':14} {zs_ua['support']:>10} {ft_ua['support']:>10}")
+
+    print()
+    print("=" * 78)
     print("COMPLIANCE CHECK (zero-shot vs. paper reference)")
     print("=" * 78)
     accp_diff = abs(zs["AccP"] - ref["AccP"])
