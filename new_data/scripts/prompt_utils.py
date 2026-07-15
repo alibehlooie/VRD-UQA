@@ -149,12 +149,46 @@ _PATCH_FACTOR = 112  # Qwen2.5-VL-7B window_size in pixels (8 patches of 14px ea
 # 112 is itself a multiple of 28, rounding to 112 automatically satisfies
 # both constraints at once.
 
+# Floor for adaptive per-page downscaling on long multi-page documents --
+# below this a page becomes unreadably small. 28 = merge_size(2) *
+# patch_size(14) is the pixel area of one MERGED visual token, so this is
+# a floor of 64 merged tokens/page. Adapted directly from a colleague's
+# GRPO training script's _MIN_DOWNSCALE_PIXELS (same value, same reasoning).
+_MIN_DOWNSCALE_PIXELS = 64 * 28 * 28
 
-def load_and_resize_image(path: Union[str, Path]) -> Image.Image:
+
+def compute_adaptive_page_pixels(n_pages: int, target_pages_equivalent: int = 5,
+                                  base_max_pixels: int = IMAGE_MAX_PIXELS) -> int:
     """
-    Resize to satisfy BOTH IMAGE_MAX_PIXELS and IMAGE_MIN_PIXELS, with
-    dimensions rounded to multiples of the patch size (28) -- mirrors
-    Qwen2.5-VL's own smart_resize logic.
+    Adapted from a colleague's GRPO training script's downscale_page_threshold
+    mechanism: for multi-page documents, instead of truncating to N pages
+    (which risks excluding the one page that actually supports the answer --
+    the exact hallucination-training risk flagged earlier for the
+    abstractive-item recovery case), show ALL pages but shrink each one's
+    resolution so the TOTAL token cost stays roughly equivalent to
+    `target_pages_equivalent` pages at full resolution, regardless of how
+    long the actual document is. A 5-page doc gets full resolution; a
+    20-page doc gets each page at ~1/4 resolution. Never goes below
+    _MIN_DOWNSCALE_PIXELS (a floor so long documents don't become
+    unreadable rather than just lower-fidelity).
+    """
+    if n_pages <= target_pages_equivalent:
+        return base_max_pixels
+    return max(_MIN_DOWNSCALE_PIXELS, int(base_max_pixels * target_pages_equivalent / n_pages))
+
+
+def load_and_resize_image(path: Union[str, Path], max_pixels: int = None) -> Image.Image:
+    """
+    Resize to satisfy BOTH max_pixels (defaults to IMAGE_MAX_PIXELS) and
+    IMAGE_MIN_PIXELS, with dimensions rounded to multiples of the window
+    size (see _PATCH_FACTOR above) -- mirrors Qwen2.5-VL's own smart_resize
+    logic, with the window-alignment fix.
+
+    max_pixels can be overridden (e.g. via compute_adaptive_page_pixels)
+    for multi-page documents where each page needs a smaller budget than
+    the single-page default -- IMAGE_MIN_PIXELS is still enforced as an
+    absolute floor regardless of the override, so a page never becomes too
+    small to form a valid merge group.
 
     The original version of this function (copied from
     evaluate_corrupted.py) only capped the MAXIMUM size and never enforced
@@ -167,6 +201,8 @@ def load_and_resize_image(path: Union[str, Path]) -> Image.Image:
     tensors are valid, just too small. This version fixes that for both
     training and eval.
     """
+    effective_max_pixels = max_pixels if max_pixels is not None else IMAGE_MAX_PIXELS
+
     image = Image.open(path).convert("RGB")
     w, h = image.width, image.height
 
@@ -174,8 +210,8 @@ def load_and_resize_image(path: Union[str, Path]) -> Image.Image:
     w_bar = max(_PATCH_FACTOR, round(w / _PATCH_FACTOR) * _PATCH_FACTOR)
     area = h_bar * w_bar
 
-    if area > IMAGE_MAX_PIXELS:
-        beta = (h * w / IMAGE_MAX_PIXELS) ** 0.5
+    if area > effective_max_pixels:
+        beta = (h * w / effective_max_pixels) ** 0.5
         h_bar = max(_PATCH_FACTOR, int(h / beta // _PATCH_FACTOR) * _PATCH_FACTOR)
         w_bar = max(_PATCH_FACTOR, int(w / beta // _PATCH_FACTOR) * _PATCH_FACTOR)
     elif area < IMAGE_MIN_PIXELS:

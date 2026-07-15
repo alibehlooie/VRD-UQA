@@ -37,7 +37,9 @@ from prompt_utils import (
     patch_file_path,
     page_image_path,
     load_and_resize_image,
+    compute_adaptive_page_pixels,
     build_messages,
+    build_messages_multi,
     build_target,
     is_refusal,
 )
@@ -112,15 +114,36 @@ def build_and_balance_records(annotations_path: str, patch_dir: Path, seed: int,
         if is_answerable:
             page = get_answer_page(item)
             if page is None:
-                # No page bbox (e.g. "abstractive" answer_type). Previously
-                # recovered as an unbounded multi-page example; reverted
-                # 2026-07-XX because concatenating many page images into
-                # one prompt triggered a Qwen2.5-VL windowed-attention
-                # crash (RuntimeError: reshape invalid for spatial_merge_unit)
-                # that a per-image patch-count pre-check couldn't fully
-                # predict. Back to dropping these, matching the original
-                # working single-image-per-example approach.
-                dropped["answerable_missing_page"] += 1
+                # No page bbox (e.g. "abstractive" answer_type). Recovered
+                # as a multi-page example over ALL of the doc's available
+                # pages, using ADAPTIVE per-page resolution (see
+                # compute_adaptive_page_pixels in prompt_utils.py) so long
+                # documents don't blow the token budget -- unlike the
+                # earlier unbounded-full-resolution attempt (reverted after
+                # a Qwen2.5-VL windowed-attention crash), which turned out
+                # to be caused by an unrelated bug in this file's own
+                # tensor handling (now fixed), not by multi-page
+                # concatenation itself. No pages are excluded, so the
+                # answer page is never at risk of being cut out --
+                # avoiding the hallucination-training risk that a hard
+                # page cap would reintroduce.
+                if not available_pages:
+                    dropped["answerable_missing_page"] += 1
+                    continue
+                answer = item["answers"][0] if item.get("answers") else None
+                if not answer:
+                    dropped["answerable_missing_page"] += 1
+                    continue
+                records.append({
+                    "example_id": question_id,
+                    "doc_id": doc_id,
+                    "page": sorted(available_pages),
+                    "is_multipage": True,
+                    "question": item["question"],
+                    "answer": answer,
+                    "is_answerable": True,
+                    "answer_type": item["answer_type"],
+                })
                 continue
             if page not in available_pages:
                 dropped["answer_page_not_in_patch_index"] += 1
