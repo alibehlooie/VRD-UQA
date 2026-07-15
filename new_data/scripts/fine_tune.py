@@ -251,6 +251,9 @@ def print_build_summary(summary: dict, n_train: int, n_val: int, records: list =
     print(f"Post-balance: answerable={summary['post_balance_counts']['answerable']}  "
           f"not_answerable={summary['post_balance_counts']['not_answerable']}  "
           f"(mode={summary['balance_mode']})")
+    if records is not None:
+        n_multi = sum(1 for r in records if r.get("is_multipage"))
+        print(f"Multi-page (recovered abstractive) records: {n_multi}")
     if summary["dropped"]:
         print("Dropped:")
         for reason, count in summary["dropped"].items():
@@ -270,20 +273,54 @@ class VRDUQADataset(Dataset):
     """
 
     def __init__(self, records: list, patch_dir: str, image_dir: str,
-                 processor, include_ocr: bool = True):
+                 processor, include_ocr: bool = True, multipage_target_pages: int = 5):
         self.records = records
         self.patch_dir = Path(patch_dir)
         self.image_dir = Path(image_dir)
         self.processor = processor
         self.include_ocr = include_ocr
+        self.multipage_target_pages = multipage_target_pages
         self.skipped_total = 0
         self.skipped_ids = []
+        self.multipage_skipped = 0
+        self.multipage_skipped_ids = []
 
     def __len__(self):
         return len(self.records)
 
     def _build_example(self, record):
         doc_id = record["doc_id"]
+        is_multipage = record.get("is_multipage", False)
+
+        if is_multipage:
+            pages = record["page"]  # list of ints, ALL available pages -- none excluded
+            per_page_pixels = compute_adaptive_page_pixels(
+                n_pages=len(pages), target_pages_equivalent=self.multipage_target_pages,
+                base_max_pixels=IMAGE_MAX_PIXELS,
+            )
+            images, ocr_pieces = [], []
+            for page in pages:
+                img_path = page_image_path(self.image_dir, doc_id, page)
+                images.append(load_and_resize_image(img_path, max_pixels=per_page_pixels))
+                if self.include_ocr:
+                    patch_path = patch_file_path(self.patch_dir, doc_id, page)
+                    if patch_path.exists():
+                        patches = load_patch_file(patch_path)
+                        page_text = extract_ocr_from_patch_file(patches, max_chars=MAX_OCR_CHARS)
+                        if page_text:
+                            ocr_pieces.append(f"[Page {page}]\n{page_text}")
+            # Cap applied once over the WHOLE joined multi-page text (not
+            # per-page) -- OCR isn't resolution-scaled like images are;
+            # this is a training-only convention for the recovered
+            # abstractive items. The eval side never hits this path since
+            # DUDE_verified is always single-page.
+            ocr_text = "\n\n".join(ocr_pieces)
+            if len(ocr_text) > MAX_OCR_CHARS:
+                ocr_text = ocr_text[:MAX_OCR_CHARS]
+            messages = build_messages_multi(images=images, question=record["question"], ocr_text=ocr_text)
+            target = build_target(record.get("answer"), record["is_answerable"])
+            return messages, target, images
+
         page = record["page"]
         img_path = page_image_path(self.image_dir, doc_id, page)
 
@@ -311,9 +348,15 @@ class VRDUQADataset(Dataset):
             # than crashing the whole run.
             self.skipped_total += 1
             self.skipped_ids.append(record["example_id"])
-            print(f"WARNING: skipping example {record['example_id']} "
-                  f"(doc_id={record['doc_id']} page={record.get('page')}) "
-                  f"-- encode failed: {e}")
+            if record.get("is_multipage"):
+                self.multipage_skipped += 1
+                self.multipage_skipped_ids.append(record["example_id"])
+                print(f"WARNING: skipping multi-page example {record['example_id']} "
+                      f"({len(record['page'])} pages) -- encode failed: {e}")
+            else:
+                print(f"WARNING: skipping example {record['example_id']} "
+                      f"(doc_id={record['doc_id']} page={record.get('page')}) "
+                      f"-- encode failed: {e}")
             fallback_idx = (idx + 1) % len(self.records)
             if fallback_idx == idx:
                 raise
@@ -693,6 +736,14 @@ def main():
                           "Defaults to --image_dir if not given.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--balance_mode", choices=["downsample_na", "none"], default="downsample_na")
+    ap.add_argument("--multipage_target_pages", type=int, default=5,
+                     help="For recovered abstractive/multi-page examples: target total "
+                          "image-token budget expressed as N full-resolution-equivalent "
+                          "pages. Docs with <= N pages get full resolution; longer docs "
+                          "get every page shown (none excluded) but proportionally "
+                          "downscaled so the total stays roughly constant. Run "
+                          "check_abstractive_page_counts.py first to pick a sensible N "
+                          "for your actual document-length distribution.")
     ap.add_argument("--no_ocr", action="store_true",
                      help="Train the no-OCR arm instead of the OCR arm.")
     ap.add_argument("--num_epochs", type=int, default=10)
@@ -773,8 +824,10 @@ def main():
     # through them correctly.
     model.enable_input_require_grads()
 
-    train_ds = VRDUQADataset(train_records, args.patch_dir, args.image_dir, processor, include_ocr=include_ocr)
-    val_ds = VRDUQADataset(val_records, val_patch_dir, val_image_dir, processor, include_ocr=include_ocr)
+    train_ds = VRDUQADataset(train_records, args.patch_dir, args.image_dir, processor,
+                              include_ocr=include_ocr, multipage_target_pages=args.multipage_target_pages)
+    val_ds = VRDUQADataset(val_records, val_patch_dir, val_image_dir, processor,
+                            include_ocr=include_ocr, multipage_target_pages=args.multipage_target_pages)
     print(f"Train examples: {len(train_ds)}  Val examples: {len(val_ds)}")
 
     training_args = TrainingArguments(
@@ -817,8 +870,10 @@ def main():
 
     trainer.train(resume_from_checkpoint=resume_ckpt)
 
-    print(f"Total examples skipped (train): {train_ds.skipped_total}")
-    print(f"Total examples skipped (val):   {val_ds.skipped_total}")
+    print(f"Total examples skipped (train): {train_ds.skipped_total}  "
+          f"(of which multi-page: {train_ds.multipage_skipped})")
+    print(f"Total examples skipped (val):   {val_ds.skipped_total}  "
+          f"(of which multi-page: {val_ds.multipage_skipped})")
     print(f"Degenerate training batches skipped (caught at model.forward): "
           f"{trainer.degenerate_batches_skipped}")
     if train_ds.skipped_ids:
