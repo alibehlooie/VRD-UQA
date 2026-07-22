@@ -44,16 +44,16 @@ from prompt_utils import (
     is_refusal,
 )
 
-MAX_SEQ_LENGTH = 8192  # separate from MAX_OCR_CHARS; tokenized-sequence cap
-MERGE_SIZE = 2  # Qwen2.5-VL vision merger spatial group size (2x2 patches -> 1 merged token)
-_DIAGNOSTIC_COUNT = [0]  # temporary, see _encode() -- remove once the mismatch is identified
+MAX_SEQ_LENGTH = 8192
+MERGE_SIZE = 2  # Qwen2.5-VL vision merger group size (2x2 patches -> 1 token)
 PATCH_NAME_RE = re.compile(r"^([0-9a-f]{32})_(\d+)\.json$")
 
 
 # ---------------------------------------------------------------------------
-# Data construction (folded in from the former build_dataset.py)
+# Data construction
 # ---------------------------------------------------------------------------
 def build_docid_page_index(patch_dir: Path):
+    """Scan the patch folder once and build {docId: sorted page numbers}."""
     index = defaultdict(list)
     for f in patch_dir.glob("*.json"):
         m = PATCH_NAME_RE.match(f.name)
@@ -67,8 +67,8 @@ def build_docid_page_index(patch_dir: Path):
 
 
 def pick_random_page(question_id: str, available_pages: list, seed: int) -> int:
-    """Deterministic pseudo-random page pick, seeded per questionId --
-    reproducible across runs, but not fixed to page 0 across the dataset."""
+    """Deterministic page pick for not-answerable questions -- seeded per
+    question so it's reproducible, but not always page 0."""
     rng = random.Random(f"{seed}-{question_id}")
     return rng.choice(available_pages)
 
@@ -81,16 +81,22 @@ def get_answer_page(item: dict):
 
 
 def build_and_balance_records(annotations_path: str, patch_dir: Path, seed: int,
-                               balance_mode: str = "downsample_na"):
+                               balance_mode: str = "downsample_na",
+                               max_images_per_doc: int = 20):
     """
-    Builds records from ONE annotations file (join + page assignment +
-    multi-page recovery + balance), with NO train/val split applied.
-    Returns (records, summary_dict).
+    Builds training records from one annotations file: joins questions
+    against the patch folder, assigns pages, recovers abstractive items
+    as multi-page examples, and balances answerable vs not-answerable.
 
     balance_mode:
-      "downsample_na" -> randomly drop not-answerable records down to
-                          match the answerable count (default, safe).
-      "none"          -> keep the natural (imbalanced) counts as-is.
+      "downsample_na" -> drop not-answerable records down to match the
+                          answerable count (default).
+      "none"          -> keep the natural counts as-is.
+
+    max_images_per_doc caps how many pages a multi-page example can show,
+    applied before the adaptive resolution scaling. Without a hard cap,
+    a pathologically long document can still exceed the GPU memory budget
+    even at the lowest resolution the adaptive scaling allows.
     """
     with open(annotations_path) as f:
         raw = json.load(f)
@@ -114,30 +120,17 @@ def build_and_balance_records(annotations_path: str, patch_dir: Path, seed: int,
         if is_answerable:
             page = get_answer_page(item)
             if page is None:
-                # No page bbox (e.g. "abstractive" answer_type). Recovered
-                # as a multi-page example over ALL of the doc's available
-                # pages, using ADAPTIVE per-page resolution (see
-                # compute_adaptive_page_pixels in prompt_utils.py) so long
-                # documents don't blow the token budget -- unlike the
-                # earlier unbounded-full-resolution attempt (reverted after
-                # a Qwen2.5-VL windowed-attention crash), which turned out
-                # to be caused by an unrelated bug in this file's own
-                # tensor handling (now fixed), not by multi-page
-                # concatenation itself. No pages are excluded, so the
-                # answer page is never at risk of being cut out --
-                # avoiding the hallucination-training risk that a hard
-                # page cap would reintroduce.
-                if not available_pages:
-                    dropped["answerable_missing_page"] += 1
-                    continue
+                # No page bbox -- recover as a multi-page example instead
+                # of dropping it.
                 answer = item["answers"][0] if item.get("answers") else None
                 if not answer:
                     dropped["answerable_missing_page"] += 1
                     continue
+                capped_pages = sorted(available_pages)[:max_images_per_doc]
                 records.append({
                     "example_id": question_id,
                     "doc_id": doc_id,
-                    "page": sorted(available_pages),
+                    "page": capped_pages,
                     "is_multipage": True,
                     "question": item["question"],
                     "answer": answer,
@@ -188,14 +181,16 @@ def build_and_balance_records(annotations_path: str, patch_dir: Path, seed: int,
 
 
 def build_records(annotations_path: str, patch_dir: Path, seed: int,
-                   balance_mode: str = "downsample_na", val_fraction: float = 0.05):
+                   balance_mode: str = "downsample_na", val_fraction: float = 0.05,
+                   max_images_per_doc: int = 20):
     """
-    Backward-compatible single-file path: builds from ONE annotations
-    file and carves off val_fraction internally. Only used when
-    --val_annotations is NOT provided. Prefer build_train_val_from_two_files
-    when you have a real held-out val file.
+    Single-file path: builds from one annotations file and carves off
+    val_fraction internally. Used when --val_annotations isn't given --
+    prefer build_train_val_from_two_files when you have a real held-out
+    val set.
     """
-    records, summary = build_and_balance_records(annotations_path, patch_dir, seed, balance_mode)
+    records, summary = build_and_balance_records(annotations_path, patch_dir, seed, balance_mode,
+                                                   max_images_per_doc=max_images_per_doc)
     ans_records = [r for r in records if r["is_answerable"]]
     unans_records = [r for r in records if not r["is_answerable"]]
 
@@ -217,26 +212,24 @@ def build_records(annotations_path: str, patch_dir: Path, seed: int,
 
 def build_train_val_from_two_files(train_annotations_path: str, val_annotations_path: str,
                                     train_patch_dir: Path, val_patch_dir: Path,
-                                    seed: int, balance_mode: str = "downsample_na"):
+                                    seed: int, balance_mode: str = "downsample_na",
+                                    max_images_per_doc: int = 20):
     """
-    Preferred path when a real held-out val file (e.g.
-    annotations_balanced_val.json) is available: builds train and val
-    INDEPENDENTLY from their own files, each balanced on its own terms,
-    with no train/val split logic at all (all of train file -> train,
-    all of val file -> val). train and val may live under different
-    patch-json folders (e.g. patches/train/ vs patches/val/) -- the
-    coverage/join step uses each file's own patch_dir.
+    Preferred path when a real held-out val file is available: builds
+    train and val independently from their own files (and, optionally,
+    their own patch folders), with no split logic needed.
     """
     train_records, train_summary = build_and_balance_records(
-        train_annotations_path, train_patch_dir, seed, balance_mode)
+        train_annotations_path, train_patch_dir, seed, balance_mode,
+        max_images_per_doc=max_images_per_doc)
     val_records, val_summary = build_and_balance_records(
-        val_annotations_path, val_patch_dir, seed, balance_mode)
+        val_annotations_path, val_patch_dir, seed, balance_mode,
+        max_images_per_doc=max_images_per_doc)
 
     combined_summary = {
         "train": train_summary,
         "val": val_summary,
         "balance_mode": balance_mode,
-        # kept for print_build_summary()'s existing single-summary shape
         "dropped": train_summary["dropped"],
         "pre_balance_counts": train_summary["pre_balance_counts"],
         "post_balance_counts": train_summary["post_balance_counts"],
@@ -266,11 +259,8 @@ def print_build_summary(summary: dict, n_train: int, n_val: int, records: list =
 # Dataset
 # ---------------------------------------------------------------------------
 class VRDUQADataset(Dataset):
-    """
-    Wraps an in-memory list of records (from build_records) and lazily
-    builds (messages, target) at __getitem__ time via the shared
-    prompt_utils functions.
-    """
+    """Wraps an in-memory list of records and lazily builds (messages,
+    target) at __getitem__ time via the shared prompt_utils functions."""
 
     def __init__(self, records: list, patch_dir: str, image_dir: str,
                  processor, include_ocr: bool = True, multipage_target_pages: int = 5):
@@ -293,7 +283,7 @@ class VRDUQADataset(Dataset):
         is_multipage = record.get("is_multipage", False)
 
         if is_multipage:
-            pages = record["page"]  # list of ints, ALL available pages -- none excluded
+            pages = record["page"]
             per_page_pixels = compute_adaptive_page_pixels(
                 n_pages=len(pages), target_pages_equivalent=self.multipage_target_pages,
                 base_max_pixels=IMAGE_MAX_PIXELS,
@@ -309,11 +299,9 @@ class VRDUQADataset(Dataset):
                         page_text = extract_ocr_from_patch_file(patches, max_chars=MAX_OCR_CHARS)
                         if page_text:
                             ocr_pieces.append(f"[Page {page}]\n{page_text}")
-            # Cap applied once over the WHOLE joined multi-page text (not
-            # per-page) -- OCR isn't resolution-scaled like images are;
-            # this is a training-only convention for the recovered
-            # abstractive items. The eval side never hits this path since
-            # DUDE_verified is always single-page.
+            # The char cap applies once over the whole joined multi-page
+            # text, not per page -- OCR doesn't get resolution-scaled the
+            # way images do.
             ocr_text = "\n\n".join(ocr_pieces)
             if len(ocr_text) > MAX_OCR_CHARS:
                 ocr_text = ocr_text[:MAX_OCR_CHARS]
@@ -341,11 +329,10 @@ class VRDUQADataset(Dataset):
         try:
             return self._encode(record)
         except Exception as e:
-            # Safety net (not a cap): the example failed to encode --
-            # either a long multi-page example too big for MAX_SEQ_LENGTH,
-            # OOM, or a degenerate image (see the image_grid_thw check in
-            # _encode). Skip it and fall back to the next example rather
-            # than crashing the whole run.
+            # Skip and fall through to the next example instead of
+            # crashing the whole run -- a long multi-page example can
+            # still be too big for MAX_SEQ_LENGTH, or hit a degenerate
+            # image grid (see the check in _encode).
             self.skipped_total += 1
             self.skipped_ids.append(record["example_id"])
             if record.get("is_multipage"):
@@ -381,31 +368,11 @@ class VRDUQADataset(Dataset):
             truncation=True, max_length=MAX_SEQ_LENGTH,
         )
 
-        # TEMPORARY DIAGNOSTIC (2026-07-12): the image_grid_thw pre-check
-        # below has never actually fired despite a 100% model.forward()
-        # crash rate -- meaning grid_thw itself looks fine by our check,
-        # but something about the actual pixel_values tensor doesn't match
-        # what that grid claims. Dump real numbers for the first few calls
-        # so we can see the actual mismatch instead of guessing further.
-        if _DIAGNOSTIC_COUNT[0] < 5:
-            _DIAGNOSTIC_COUNT[0] += 1
-            img = image_or_images if not isinstance(image_or_images, list) else image_or_images[0]
-            pv_shape = tuple(full_enc["pixel_values"].shape) if "pixel_values" in full_enc else None
-            grid_vals = full_enc["image_grid_thw"].tolist() if "image_grid_thw" in full_enc else None
-            n_images = len(image_inputs) if isinstance(image_inputs, list) else 1
-            print(f"DIAGNOSTIC[{_DIAGNOSTIC_COUNT[0]}] doc_id={record['doc_id']} "
-                  f"page={record.get('page')} PIL_size(w,h)={img.size} "
-                  f"n_images_in_message={n_images} "
-                  f"pixel_values.shape={pv_shape} image_grid_thw={grid_vals} "
-                  f"input_ids.shape={tuple(full_enc['input_ids'].shape)}")
-
-        # Proactive check: Qwen2.5-VL's vision merger groups patches in
-        # blocks of SPATIAL_MERGE_UNIT (4) via a 2D (h,w) spatial grouping --
-        # NOT just total patch count divisible by 4. A lopsided grid like
-        # (t=1,h=1,w=4) has total=4 (passes a naive total%4==0 check) but
-        # h=1 can't be split into 2-row groups, and still crashes deep in
-        # model.forward(). Check h and w individually divisible by
-        # MERGE_SIZE instead.
+        # The vision merger groups patches in 2x2 blocks along height and
+        # width independently -- a grid like (t=1,h=1,w=4) has a total
+        # patch count divisible by 4 but still can't form a valid 2-row
+        # group, and crashes deep in model.forward(). Check h and w
+        # separately rather than just the total.
         if "image_grid_thw" in full_enc:
             for grid in full_enc["image_grid_thw"]:
                 t, h, w = (int(x) for x in grid.tolist())
@@ -421,27 +388,14 @@ class VRDUQADataset(Dataset):
         prompt_len = prompt_enc["input_ids"].shape[1]
         labels[:prompt_len] = -100  # loss only on the completion
 
-        # BUG FIX (2026-07-12): pixel_values and image_grid_thw are NOT
-        # batched per-example the way input_ids/attention_mask are.
-        # Qwen2.5-VL's processor returns pixel_values as a FLAT tensor of
-        # shape (total_patches, feature_dim) across however many images
-        # were passed, and image_grid_thw as (num_images, 3) -- neither
-        # has a real leading "batch" dimension to strip. Blindly doing
-        # v[0] on pixel_values (as this used to) sliced out just the
-        # FIRST PATCH ROW, collapsing e.g. a (4480, 1176) tensor down to
-        # (1176,). After the collator's unsqueeze(0), the model received
-        # exactly one patch -- which is a (1, hidden_size) tensor after
-        # patch embedding, i.e. exactly 1280 total elements for this
-        # model's hidden_size -- an EXACT match for the
-        # "shape '[0,4,-1]' is invalid for input of size 1280" crash that
-        # was 100% reproducible on every single training image,
-        # regardless of image content, LoRA config, attention backend, or
-        # transformers version. This was never caught by minimal_repro.py
-        # because that script uses processor() output directly, without
-        # ever going through this slicing at all.
-        NO_BATCH_DIM_KEYS = {"pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"}
+        # pixel_values and image_grid_thw aren't batched per-example the
+        # way input_ids/attention_mask are -- the processor returns
+        # pixel_values as a flat (total_patches, feature_dim) tensor and
+        # image_grid_thw as (num_images, 3), with no real leading batch
+        # dimension to strip. Only squeeze the keys that actually have one.
+        no_batch_dim_keys = {"pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"}
         item = {
-            k: (v if k in NO_BATCH_DIM_KEYS else v[0])
+            k: (v if k in no_batch_dim_keys else v[0])
             for k, v in full_enc.items()
         }
         item["labels"] = labels
@@ -450,17 +404,15 @@ class VRDUQADataset(Dataset):
 
 @dataclass
 class SingleExampleCollator:
-    """BATCH_SIZE=1 -- nothing to pad across examples. Only input_ids/
-    attention_mask/labels get a batch dimension added; pixel_values and
-    image_grid_thw are already in the flat shape the model expects
-    (see the matching fix in VRDUQADataset._encode()) and must NOT be
-    unsqueezed -- doing so previously added a spurious leading dimension
-    on top of an already-wrong single-patch slice."""
+    """Batch size is always 1, so there's nothing to pad across examples --
+    just add the batch dimension back for the keys that need it.
+    pixel_values/image_grid_thw are already in the shape the model
+    expects and must not be unsqueezed."""
 
     NO_BATCH_DIM_KEYS = {"pixel_values", "image_grid_thw", "pixel_values_videos", "video_grid_thw"}
 
     def __call__(self, features):
-        assert len(features) == 1, "This collator assumes BATCH_SIZE=1"
+        assert len(features) == 1, "This collator assumes batch_size=1"
         f = features[0]
         return {
             k: (v if k in self.NO_BATCH_DIM_KEYS else v.unsqueeze(0))
@@ -473,21 +425,12 @@ class SingleExampleCollator:
 # ---------------------------------------------------------------------------
 def find_all_linear_names(model):
     """
-    Collects nn.Linear leaf names for LoRA's target_modules -- LLM decoder
-    only, matching the last-known-working version's LORA_TARGET_MODULES
-    (q_proj/k_proj/v_proj/o_proj/gate_proj/up_proj/down_proj). This
-    explicitly EXCLUDES anything under the vision tower ("visual.*":
-    attention qkv/proj, and the Sequential-indexed merger MLP).
-
-    Earlier versions of this file collected every nn.Linear in the WHOLE
-    model, including the vision tower, and wrapped those in LoRA too --
-    that produced a 100% reproducible crash on every single training
-    image ("shape '[0,4,-1]' is invalid...", deep in Qwen2.5-VL's window-
-    index/reshape logic), which several rounds of image-resize and
-    version-pin fixes failed to resolve. The old working version never
-    touched the vision tower with LoRA at all -- only the LLM decoder's
-    projections -- which is also the standard/common practice for
-    Qwen2.5-VL LoRA fine-tuning. Restricting to LLM-only here to match.
+    Collects the LLM decoder's linear projection names for LoRA's
+    target_modules -- q/k/v/o_proj and gate/up/down_proj. Deliberately
+    excludes the vision tower entirely: LoRA-adapting vision layers isn't
+    necessary here and caused problems with Qwen2.5-VL's windowed
+    attention during testing, so this sticks to the standard practice of
+    only targeting the language model side.
     """
     llm_target_leaves = {
         "q_proj", "k_proj", "v_proj", "o_proj",
@@ -496,12 +439,41 @@ def find_all_linear_names(model):
     names = set()
     for name, module in model.named_modules():
         if name.startswith("visual") or ".visual." in name:
-            continue  # exclude the entire vision tower
+            continue
         if isinstance(module, torch.nn.Linear):
             leaf = name.split(".")[-1]
             if leaf in llm_target_leaves:
                 names.add(leaf)
     return sorted(names)
+
+
+def freeze_vision_tower_no_grad(model):
+    """
+    Wraps the vision tower's forward pass in torch.no_grad(). LoRA
+    already only targets the LLM side, so the vision tower's weights
+    don't need gradients -- but gradient checkpointing doesn't know that
+    in advance, and wraps every block uniformly, recomputing the vision
+    tower's forward pass on every backward step for no benefit. This
+    removes that cost entirely instead of relying on requires_grad=False
+    alone.
+    """
+    if not hasattr(model, "visual"):
+        print("WARNING: model has no top-level 'visual' attribute -- "
+              "check model.named_children() for the actual name. "
+              "Skipping; vision tower will still be gradient-checkpointed normally.")
+        return model
+
+    original_forward = model.visual.forward
+
+    def no_grad_forward(*args, **kwargs):
+        with torch.no_grad():
+            return original_forward(*args, **kwargs)
+
+    model.visual.forward = no_grad_forward
+    for p in model.visual.parameters():
+        p.requires_grad = False
+    print("Vision tower forward wrapped in torch.no_grad().")
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -540,17 +512,21 @@ def compute_binary_classification_metrics(preds_refused, trues_refused):
 
 
 class VRDUQATrainer(Trainer):
-    """Overrides evaluate() to run real generation and merge macro_f1 /
-    ans_acc / unans_acc / selection_score into the metrics dict BEFORE
-    Trainer's best-model / early-stopping logic consumes it. Also
-    overrides training_step() as a last-resort safety net: the
-    image_grid_thw check in VRDUQADataset._encode() catches the obvious
-    single-image "too few patches" case, but Qwen2.5-VL's windowed
-    attention has more complex constraints across CONCATENATED multi-page
-    images that a simple per-image patch-count check can't fully predict.
-    If a batch still fails deep inside model.forward() despite passing
-    that check, this catches it here, logs which step, and skips the
-    batch (zero contribution, no crash) instead of losing the whole run."""
+    """
+    Overrides evaluate() to run real generation and merge macro_f1 /
+    ans_acc / unans_acc / selection_score into the metrics dict before
+    Trainer's best-model / early-stopping logic reads it -- calling
+    super().evaluate() directly would fire the early-stopping callback
+    with only the base eval_loss, one step too early to see these.
+
+    Also overrides training_step()/prediction_step() as a safety net:
+    the per-image grid check in _encode() catches the obvious cases, but
+    Qwen2.5-VL's windowed attention has constraints across concatenated
+    multi-page images that a simple per-image check can't fully predict,
+    and large multi-page examples can occasionally OOM. Either failure
+    gets caught here, logged, and the batch is skipped rather than
+    losing the whole run.
+    """
 
     def __init__(self, *args, gen_max_new_tokens=64, gen_subset_size=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -562,49 +538,50 @@ class VRDUQATrainer(Trainer):
         try:
             return super().training_step(model, inputs, num_items_in_batch)
         except RuntimeError as e:
-            if "is invalid for input of size" in str(e) or "spatial_merge_unit" in str(e):
+            is_shape_bug = "is invalid for input of size" in str(e) or "spatial_merge_unit" in str(e)
+            is_oom = "out of memory" in str(e).lower()
+            if is_shape_bug or is_oom:
                 self.degenerate_batches_skipped += 1
+                kind = "OOM" if is_oom else "degenerate image batch"
                 print(f"WARNING: skipping training step {self.state.global_step} -- "
-                      f"degenerate image batch made it past the pre-check "
-                      f"(total skipped so far: {self.degenerate_batches_skipped}): {e}")
+                      f"{kind} (total skipped so far: {self.degenerate_batches_skipped}): {e}")
                 model.zero_grad(set_to_none=True)
+                if is_oom:
+                    # `inputs` is a function parameter, so it stays
+                    # referenced (and its GPU tensors stay resident) for
+                    # the rest of this function even inside this except
+                    # block -- empty_cache() alone won't release memory
+                    # that's still referenced. Drop the reference and
+                    # force garbage collection first, since the failed
+                    # step's tensors would otherwise linger and eat into
+                    # the next step's budget.
+                    del inputs
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 return torch.tensor(0.0, device=self.args.device)
             raise
 
     def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        # Same crash class as training_step, but this is what HF's own
-        # evaluation_loop calls internally during super().evaluate() below
-        # -- the __getitem__/_encode-level pre-check can pass (the item
-        # "encoded fine") and the crash still only surfaces once the
-        # actual forward pass runs, same as training. Mirror the same
-        # catch-and-skip here so eval doesn't lose the whole run either.
         try:
             return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys=ignore_keys)
         except RuntimeError as e:
-            if "is invalid for input of size" in str(e) or "spatial_merge_unit" in str(e):
+            is_shape_bug = "is invalid for input of size" in str(e) or "spatial_merge_unit" in str(e)
+            is_oom = "out of memory" in str(e).lower()
+            if is_shape_bug or is_oom:
                 self.degenerate_batches_skipped += 1
-                print(f"WARNING: skipping eval prediction step -- degenerate image batch "
+                kind = "OOM" if is_oom else "degenerate image batch"
+                print(f"WARNING: skipping eval prediction step -- {kind} "
                       f"(total skipped so far: {self.degenerate_batches_skipped}): {e}")
+                if is_oom:
+                    del inputs
+                    import gc
+                    gc.collect()
+                    torch.cuda.empty_cache()
                 return (None, None, None)
             raise
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix="eval"):
-        """
-        Deliberately does NOT call super().evaluate() -- that high-level
-        wrapper internally fires callback_handler.on_evaluate() (which is
-        what EarlyStoppingCallback listens to) BEFORE returning control
-        back here, using only the base eval_loss-style metrics. Our
-        generation-based eval_selection_score would then be merged in too
-        late for EarlyStoppingCallback to ever see it on its one look per
-        round -- exactly the "early stopping required metric_for_best_model,
-        but did not find eval_selection_score" warning, every epoch.
-
-        Checkpoint-saving (load_best_model_at_end) was unaffected by that
-        bug since it re-reads whatever this method eventually returns, but
-        early stopping specifically needs the callback fired with the
-        FULL metrics dict, which means computing everything first and
-        only then triggering logging/callbacks ourselves.
-        """
         eval_dataset_to_use = eval_dataset if eval_dataset is not None else self.eval_dataset
         eval_dataloader = self.get_eval_dataloader(eval_dataset_to_use)
         start_time = time.time()
@@ -684,7 +661,6 @@ class VRDUQATrainer(Trainer):
         if gen_eval_skipped:
             print(f"Generation eval: skipped {gen_eval_skipped}/{len(records)} examples")
 
-
         metrics = compute_binary_classification_metrics(preds_refused, trues_refused)
         selection_score = metrics["macro_f1"] - 0.5 * max(
             0.0, metrics["unans_acc"] - metrics["ans_acc"]
@@ -699,51 +675,32 @@ class VRDUQATrainer(Trainer):
 # Main
 # ---------------------------------------------------------------------------
 def main():
-    # UNMISTAKABLE VERSION FINGERPRINT (2026-07-12): five consecutive
-    # supposedly-different fixes have produced byte-identical failure
-    # counts (1978->1987, steps 247-248) in the training log. That's not
-    # plausible as a coincidence of real model behavior -- it strongly
-    # suggests the running job is NOT using the code being edited. This
-    # print is the definitive test: if this exact string does not appear
-    # at the top of your .out log, the file that ran is NOT this file,
-    # and the actual next step is investigating deployment (stale copy,
-    # __pycache__, network-filesystem mtime granularity, wrong path) --
-    # NOT another guess about Qwen2.5-VL internals.
-    print(">>> FINGERPRINT: fine_tune.py VERSION=LLM_ONLY_LORA_FIX_2026_07_12 <<<", flush=True)
-    import sys as _sys
-    print(f">>> FINGERPRINT: running from {__file__} <<<", flush=True)
-    print(f">>> FINGERPRINT: python executable = {_sys.executable} <<<", flush=True)
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--model_id", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--annotations", required=True,
                      help="Path to annotations_balanced_train.json")
     ap.add_argument("--val_annotations", default=None,
-                     help="Path to a real held-out val file (e.g. "
-                          "annotations_balanced_val.json). If given, train "
-                          "uses 100%% of --annotations and val is built "
-                          "independently from this file (no internal split). "
-                          "If omitted, falls back to carving val_fraction off "
-                          "--annotations.")
+                     help="Path to a real held-out val file. If given, train uses "
+                          "100%% of --annotations and val is built independently "
+                          "from this file. If omitted, falls back to carving "
+                          "val_fraction off --annotations.")
     ap.add_argument("--patch_dir", required=True, help="Train patch-json folder")
     ap.add_argument("--image_dir", required=True, help="Train page-image folder")
     ap.add_argument("--val_patch_dir", default=None,
-                     help="Val patch-json folder, if different from --patch_dir "
-                          "(e.g. a separate patches/val/ directory). Defaults to "
-                          "--patch_dir if not given.")
+                     help="Val patch-json folder, if different from --patch_dir.")
     ap.add_argument("--val_image_dir", default=None,
-                     help="Val page-image folder, if different from --image_dir. "
-                          "Defaults to --image_dir if not given.")
+                     help="Val page-image folder, if different from --image_dir.")
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--balance_mode", choices=["downsample_na", "none"], default="downsample_na")
     ap.add_argument("--multipage_target_pages", type=int, default=5,
-                     help="For recovered abstractive/multi-page examples: target total "
-                          "image-token budget expressed as N full-resolution-equivalent "
-                          "pages. Docs with <= N pages get full resolution; longer docs "
-                          "get every page shown (none excluded) but proportionally "
-                          "downscaled so the total stays roughly constant. Run "
-                          "check_abstractive_page_counts.py first to pick a sensible N "
-                          "for your actual document-length distribution.")
+                     help="Target image-token budget for multi-page examples, "
+                          "expressed as N full-resolution-equivalent pages. Docs "
+                          "with <= N pages get full resolution; longer docs get "
+                          "every page shown (up to --max_images_per_doc) but "
+                          "scaled down so the total stays roughly constant.")
+    ap.add_argument("--max_images_per_doc", type=int, default=20,
+                     help="Hard cap on pages per multi-page example, applied "
+                          "before the adaptive resolution scaling above.")
     ap.add_argument("--no_ocr", action="store_true",
                      help="Train the no-OCR arm instead of the OCR arm.")
     ap.add_argument("--num_epochs", type=int, default=10)
@@ -752,9 +709,15 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--lora_r", type=int, default=16)
     ap.add_argument("--lora_alpha", type=int, default=32)
+    ap.add_argument("--freeze_vision_tower", action="store_true", default=True,
+                     help="Wrap the vision tower forward in torch.no_grad() to "
+                          "avoid gradient-checkpointing recomputation cost for it. "
+                          "LoRA already only targets the LLM side, so this doesn't "
+                          "change what's trainable.")
+    ap.add_argument("--no_freeze_vision_tower", dest="freeze_vision_tower", action="store_false")
     ap.add_argument("--early_stopping_patience", type=int, default=4)
     ap.add_argument("--gen_subset_size", type=int, default=200,
-                     help="Cap generation-eval to N examples per eval round; "
+                     help="Cap generation-eval to N examples per round; "
                           "None = full val set.")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -766,10 +729,7 @@ def main():
 
     done_marker = output_dir / "TRAINING_COMPLETE"
     if done_marker.exists():
-        print(f"{done_marker} already exists -- training already completed. Exiting (no-op).")
-        print("(This is expected if a chained successor job started after the run "
-              "already finished cleanly; the .sh script's cancel step should "
-              "normally prevent this from happening, but this is a safety net.)")
+        print(f"{done_marker} already exists -- training already completed. Exiting.")
         return
 
     val_patch_dir = args.val_patch_dir or args.patch_dir
@@ -783,12 +743,13 @@ def main():
             args.annotations, args.val_annotations,
             Path(args.patch_dir), Path(val_patch_dir),
             args.seed, balance_mode=args.balance_mode,
+            max_images_per_doc=args.max_images_per_doc,
         )
     else:
-        print("No --val_annotations given -- carving 5% off --annotations for val "
-              "(pass --val_annotations to use a real held-out file instead).")
+        print("No --val_annotations given -- carving 5% off --annotations for val.")
         train_records, val_records, summary = build_records(
             args.annotations, Path(args.patch_dir), args.seed, balance_mode=args.balance_mode,
+            max_images_per_doc=args.max_images_per_doc,
         )
     print_build_summary(summary, len(train_records), len(val_records), records=train_records + val_records)
 
@@ -800,6 +761,8 @@ def main():
         args.model_id, torch_dtype=torch.bfloat16, device_map="auto",
         attn_implementation="sdpa",
     )
+    if args.freeze_vision_tower:
+        model = freeze_vision_tower_no_grad(model)
     model.gradient_checkpointing_enable()
 
     target_modules = find_all_linear_names(model)
@@ -815,13 +778,9 @@ def main():
     )
     model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-    # Required when combining LoRA (frozen base model) with gradient
-    # checkpointing: PyTorch's checkpoint mechanism needs at least one
-    # tensor in the checkpointed region to require grad to properly track
-    # backprop through it. Without this, the "None of the inputs have
-    # requires_grad=True" warning isn't just noise -- it can mean frozen
-    # layers wrapping LoRA adapters silently don't get gradients flowing
-    # through them correctly.
+    # Needed when combining LoRA with gradient checkpointing: the
+    # checkpoint mechanism needs at least one tensor in the checkpointed
+    # region to require grad to track backprop through it correctly.
     model.enable_input_require_grads()
 
     train_ds = VRDUQADataset(train_records, args.patch_dir, args.image_dir, processor,

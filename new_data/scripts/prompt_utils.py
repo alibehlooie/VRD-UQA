@@ -6,13 +6,12 @@ from typing import List, Tuple, Optional, Union
 from PIL import Image
 
 # ---------------------------------------------------------------------------
-# Constants (authoritative)
+# Constants
 # ---------------------------------------------------------------------------
 IMAGE_MIN_PIXELS = 256 * 28 * 28
 IMAGE_MAX_PIXELS = 1280 * 28 * 28
-MAX_OCR_CHARS = 8000  # was 2000 in the original eval script; unified 2026-07-07
+MAX_OCR_CHARS = 8000
 
-# Mirrors the paper's Gemini 2.0 Flash output standardizer
 REFUSAL_PHRASES = [
     "unable to determine",
     "cannot determine",
@@ -35,10 +34,8 @@ REFUSAL_PHRASES = [
     "no answer",
 ]
 
-# The canonical phrase used as the SFT training target for unanswerable
-# questions. Must be one of REFUSAL_PHRASES (it is -- first entry) so
-# is_refusal() recognizes it, and matches the eval prompt's own guideline
-# wording ("If uncertain, return 'Unable to determine'").
+# The training target for unanswerable questions. Needs to be one of
+# REFUSAL_PHRASES (it's the first entry) so is_refusal() picks it up.
 REFUSAL_TARGET = "Unable to determine"
 
 
@@ -48,17 +45,15 @@ def is_refusal(text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Core reading-order sort + join (shared by both schema adapters below)
+# Reading-order sort + join
 # ---------------------------------------------------------------------------
 def _sort_and_join(items: List[Tuple[list, str]], max_chars: int = MAX_OCR_CHARS) -> str:
     """
-    items: list of (bbox, text) where bbox = [x0, y0, x1, y1].
-    Sort key is (y0, x0) -- plain top-to-bottom-then-left-to-right, NO
-    column-splitting heuristic. This is the eval script's verified
-    convention (~0.55 raw monotonicity without sorting, confirmed fixed
-    by this simple sort) -- do not "improve" this into a 2-column-aware
-    sort without re-validating against the eval script, or you reintroduce
-    train/eval divergence.
+    items: list of (bbox, text), bbox = [x0, y0, x1, y1].
+    Sorted top-to-bottom then left-to-right by (y0, x0) -- plain sort, no
+    column-splitting. This matches what the eval side already does, so
+    don't get clever with a 2-column-aware sort here without updating
+    both places at once.
     """
     valid = [(bbox, text.strip()) for bbox, text in items if text and text.strip()]
     valid.sort(key=lambda x: (x[0][1], x[0][0]))
@@ -69,7 +64,7 @@ def _sort_and_join(items: List[Tuple[list, str]], max_chars: int = MAX_OCR_CHARS
 
 
 # ---------------------------------------------------------------------------
-# Schema adapter: training-side patch-json files
+# Training-side OCR (patch-json files)
 # ---------------------------------------------------------------------------
 def load_patch_file(patch_path: Path) -> List[dict]:
     with open(patch_path) as f:
@@ -78,14 +73,10 @@ def load_patch_file(patch_path: Path) -> List[dict]:
 
 def extract_ocr_from_patch_file(patches: List[dict], max_chars: int = MAX_OCR_CHARS) -> str:
     """
-    Training-side OCR extraction from a patch-json file (one page).
     content_type == "ocr"      -> use `text`
-    content_type == "caption"  -> use `caption` (figure captions are
-                                   merged in as plain text, matching how
-                                   DUDE_verified's OCR field already
-                                   contains captions with no special
-                                   wrapping/prefix)
-    content_type == "skip"     -> dropped (abandon elements)
+    content_type == "caption"  -> use `caption` (figure captions, folded
+                                   in as plain text)
+    content_type == "skip"     -> dropped (headers/footers/etc.)
     """
     items = []
     for p in patches:
@@ -94,7 +85,6 @@ def extract_ocr_from_patch_file(patches: List[dict], max_chars: int = MAX_OCR_CH
             items.append((p["bbox"], p["text"]))
         elif ct == "caption" and p.get("caption"):
             items.append((p["bbox"], p["caption"]))
-        # ct == "skip" -> dropped
     return _sort_and_join(items, max_chars=max_chars)
 
 
@@ -107,17 +97,15 @@ def page_image_path(image_dir: Path, doc_id: str, page: int, ext: str = "jpg") -
 
 
 # ---------------------------------------------------------------------------
-# Schema adapter: eval-side DUDE_verified.json embedded layout_analysis
+# Eval-side OCR (DUDE_verified.json's embedded layout_analysis)
 # ---------------------------------------------------------------------------
 def get_all_page_ids(item: dict) -> list:
-    """Return ALL page ids in the document (from layout_analysis)."""
+    """All page ids for this document, from its embedded layout_analysis."""
     pages = item.get("layout_analysis", {}).get("pages", {})
     return list(pages.keys())
 
 
 def extract_ocr_from_layout_analysis(item: dict, page_id: str, max_chars: int = MAX_OCR_CHARS) -> str:
-    """Eval-side OCR extraction from DUDE_verified.json's embedded
-    layout_analysis for a given page_id."""
     try:
         page_data = item["layout_analysis"]["pages"][page_id]
         objs = page_data.get("layout_analysis", {})
@@ -132,74 +120,53 @@ def extract_ocr_from_layout_analysis(item: dict, page_id: str, max_chars: int = 
 
 
 # ---------------------------------------------------------------------------
-# Image loading (matches evaluate_corrupted.py's resize-if-over-max logic)
+# Image loading / resizing
 # ---------------------------------------------------------------------------
-print(">>> FINGERPRINT: prompt_utils.py VERSION=LLM_ONLY_LORA_FIX_2026_07_12 "
-      f"(_PATCH_FACTOR will be defined below) imported from {__file__} <<<", flush=True)
+_PATCH_FACTOR = 112  # window size in pixels for Qwen2.5-VL-7B (8 patches of 14px)
+# Rounding to a multiple of 28 (patch*merge) is enough for the vision
+# merger's 2x2 grouping, but not enough for the windowed attention, which
+# needs whole windows of 8 patches per side. An image sized to a 28-
+# multiple but not a 112-multiple can produce a partial edge window that
+# crashes deep in the model's forward pass. 112 is itself a multiple of
+# 28, so rounding to it satisfies both at once.
 
-_PATCH_FACTOR = 112  # Qwen2.5-VL-7B window_size in pixels (8 patches of 14px each).
-# NOTE: 28 (patch_size*merge_size) only guarantees clean 2x2 MERGE alignment.
-# It does NOT guarantee clean WINDOW alignment (window_size=112px=8 patches),
-# and a dimension that isn't a whole number of windows produces a partial
-# edge window whose patch count can fail the merge reshape deep in
-# model.forward() -- this was the actual root cause of a 100%-reproducible
-# "shape '[0,4,-1]' is invalid" crash across every single training image
-# (confirmed via diagnostic: every failing image had grid h or w not
-# divisible by 8, even though all were correctly divisible by 2). Since
-# 112 is itself a multiple of 28, rounding to 112 automatically satisfies
-# both constraints at once.
-
-# Floor for adaptive per-page downscaling on long multi-page documents --
-# below this a page becomes unreadably small. 28 = merge_size(2) *
-# patch_size(14) is the pixel area of one MERGED visual token, so this is
-# a floor of 64 merged tokens/page. Adapted directly from a colleague's
-# GRPO training script's _MIN_DOWNSCALE_PIXELS (same value, same reasoning).
-_MIN_DOWNSCALE_PIXELS = 64 * 28 * 28
+_MIN_DOWNSCALE_PIXELS = 64 * 28 * 28  # floor so long documents stay legible
+_MULTIPAGE_MAX_PIXELS_PER_PAGE = 300_000
+# Ceiling on top of the ratio formula below. Without it, a document with
+# only 2-3 pages can get a much larger per-page budget than a 6+ page one
+# (since there's less need to shrink to hit the target), and a handful of
+# large images turned out to cost more GPU memory than many small ones at
+# a similar total token count. 300K keeps some margin under the largest
+# value that measured safely in testing.
 
 
 def compute_adaptive_page_pixels(n_pages: int, target_pages_equivalent: int = 5,
                                   base_max_pixels: int = IMAGE_MAX_PIXELS) -> int:
     """
-    Adapted from a colleague's GRPO training script's downscale_page_threshold
-    mechanism: for multi-page documents, instead of truncating to N pages
-    (which risks excluding the one page that actually supports the answer --
-    the exact hallucination-training risk flagged earlier for the
-    abstractive-item recovery case), show ALL pages but shrink each one's
-    resolution so the TOTAL token cost stays roughly equivalent to
-    `target_pages_equivalent` pages at full resolution, regardless of how
-    long the actual document is. A 5-page doc gets full resolution; a
-    20-page doc gets each page at ~1/4 resolution. Never goes below
-    _MIN_DOWNSCALE_PIXELS (a floor so long documents don't become
-    unreadable rather than just lower-fidelity).
+    For multi-page documents, show every page but shrink each one's
+    resolution so the total image-token cost stays roughly equivalent to
+    `target_pages_equivalent` pages at full resolution -- regardless of
+    how long the document actually is. A short doc gets full resolution;
+    a long one gets each page scaled down proportionally. This avoids
+    having to pick which pages to drop (which risks cutting the one page
+    that actually has the answer).
     """
-    if n_pages <= target_pages_equivalent:
+    if n_pages <= 1:
         return base_max_pixels
-    return max(_MIN_DOWNSCALE_PIXELS, int(base_max_pixels * target_pages_equivalent / n_pages))
+    if n_pages <= target_pages_equivalent:
+        px = base_max_pixels
+    else:
+        px = max(_MIN_DOWNSCALE_PIXELS, int(base_max_pixels * target_pages_equivalent / n_pages))
+    return min(px, _MULTIPAGE_MAX_PIXELS_PER_PAGE)
 
 
 def load_and_resize_image(path: Union[str, Path], max_pixels: int = None) -> Image.Image:
     """
-    Resize to satisfy BOTH max_pixels (defaults to IMAGE_MAX_PIXELS) and
-    IMAGE_MIN_PIXELS, with dimensions rounded to multiples of the window
-    size (see _PATCH_FACTOR above) -- mirrors Qwen2.5-VL's own smart_resize
-    logic, with the window-alignment fix.
-
-    max_pixels can be overridden (e.g. via compute_adaptive_page_pixels)
-    for multi-page documents where each page needs a smaller budget than
-    the single-page default -- IMAGE_MIN_PIXELS is still enforced as an
-    absolute floor regardless of the override, so a page never becomes too
-    small to form a valid merge group.
-
-    The original version of this function (copied from
-    evaluate_corrupted.py) only capped the MAXIMUM size and never enforced
-    a minimum or patch-size rounding. For naturally small page images,
-    that meant no upscaling ever happened, and Qwen2.5-VL's vision merger
-    (which groups patches in blocks of 4) could end up with fewer than 4
-    total patches for the whole image, crashing with a reshape error
-    ("shape '[0, 4, -1]' is invalid ...") deep inside the model forward
-    pass -- not something a dataset-level try/except can catch, since the
-    tensors are valid, just too small. This version fixes that for both
-    training and eval.
+    Resize to fit within max_pixels (defaults to IMAGE_MAX_PIXELS) while
+    respecting IMAGE_MIN_PIXELS as a floor, rounding both dimensions to
+    multiples of _PATCH_FACTOR. Pass max_pixels explicitly (e.g. via
+    compute_adaptive_page_pixels) for multi-page examples that need a
+    smaller per-page budget than the single-page default.
     """
     effective_max_pixels = max_pixels if max_pixels is not None else IMAGE_MAX_PIXELS
 
@@ -216,7 +183,7 @@ def load_and_resize_image(path: Union[str, Path], max_pixels: int = None) -> Ima
         w_bar = max(_PATCH_FACTOR, int(w / beta // _PATCH_FACTOR) * _PATCH_FACTOR)
     elif area < IMAGE_MIN_PIXELS:
         beta = (IMAGE_MIN_PIXELS / (h * w)) ** 0.5
-        h_bar = -(-int(h * beta) // _PATCH_FACTOR) * _PATCH_FACTOR  # ceil to multiple
+        h_bar = -(-int(h * beta) // _PATCH_FACTOR) * _PATCH_FACTOR
         w_bar = -(-int(w * beta) // _PATCH_FACTOR) * _PATCH_FACTOR
 
     if (h_bar, w_bar) != (h, w):
@@ -225,7 +192,7 @@ def load_and_resize_image(path: Union[str, Path], max_pixels: int = None) -> Ima
 
 
 # ---------------------------------------------------------------------------
-# Prompt / chat-message construction (verbatim from evaluate_corrupted.py)
+# Prompt / chat-message construction
 # ---------------------------------------------------------------------------
 def build_prompt(question: str, ocr_text: str) -> str:
     header = (
@@ -246,16 +213,10 @@ def build_prompt(question: str, ocr_text: str) -> str:
 
 def build_messages(image: Union[str, Path, Image.Image], question: str, ocr_text: str) -> List[dict]:
     """
-    Single user-role message, matching evaluate_corrupted.py's
-    run_inference exactly -- NO system role. `image` can be a path or an
-    already-loaded PIL.Image (qwen_vl_utils.process_vision_info accepts
-    either).
-
-    min_pixels/max_pixels are passed explicitly per-image so
-    process_vision_info uses OUR bounds rather than its own internal
-    defaults -- it re-derives image size independently of whatever we
-    already did to the PIL object, so relying on pre-resizing alone isn't
-    sufficient.
+    Single user-role message, no system role -- matches the eval script's
+    run_inference exactly. `image` can be a path or an already-loaded
+    PIL.Image. min_pixels/max_pixels are passed explicitly per-image so
+    process_vision_info uses our bounds rather than recomputing its own.
     """
     return [
         {
@@ -273,12 +234,9 @@ def build_messages(image: Union[str, Path, Image.Image], question: str, ocr_text
 
 def build_messages_multi(images: List[Union[str, Path, Image.Image]], question: str, ocr_text: str) -> List[dict]:
     """
-    Multi-page variant: one user-role message with multiple image blocks
-    followed by the same build_prompt() text used everywhere else. Only
-    used on the training side for answerable items with no page bbox
-    (e.g. "abstractive" answer_type) -- the eval side (DUDE_verified) is
-    always single-page per the paper's methodology, so this is additive,
-    not a change to the shared single-page path.
+    Multi-page variant of build_messages: several image blocks in one
+    user message, same prompt text. Used on the training side for
+    answerable questions that don't have a verified answer page.
     """
     content = [
         {
