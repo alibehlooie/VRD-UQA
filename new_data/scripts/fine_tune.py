@@ -311,7 +311,8 @@ class VRDUQADataset(Dataset):
             ocr_text = "\n\n".join(ocr_pieces)
             if len(ocr_text) > MAX_OCR_CHARS:
                 ocr_text = ocr_text[:MAX_OCR_CHARS]
-            messages = build_messages_multi(images=images, question=record["question"], ocr_text=ocr_text)
+            messages = build_messages_multi(images=images, question=record["question"], ocr_text=ocr_text,
+                                             max_pixels=per_page_pixels)
             target = build_target(record.get("answer"), record["is_answerable"])
             return messages, target, images
 

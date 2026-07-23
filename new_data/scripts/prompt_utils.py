@@ -232,16 +232,32 @@ def build_messages(image: Union[str, Path, Image.Image], question: str, ocr_text
     ]
 
 
-def build_messages_multi(images: List[Union[str, Path, Image.Image]], question: str, ocr_text: str) -> List[dict]:
+def build_messages_multi(images: List[Union[str, Path, Image.Image]], question: str, ocr_text: str,
+                          max_pixels: int = None) -> List[dict]:
     """
     Multi-page variant of build_messages: several image blocks in one
     user message, same prompt text. Used on the training side for
     answerable questions that don't have a verified answer page.
+
+    max_pixels should be the SAME value passed to load_and_resize_image()
+    for these images (e.g. from compute_adaptive_page_pixels), not the
+    global IMAGE_MAX_PIXELS. process_vision_info re-derives image size
+    from whatever min_pixels/max_pixels are in the message dict, using
+    its own rounding (factor=28), regardless of how we already resized
+    the PIL object -- if the message declares a larger budget than what
+    we actually resized to, it recomputes a different, larger size that
+    isn't guaranteed to be window-aligned (multiple of 112), which is
+    what caused a "Degenerate image grid" failure on nearly every
+    multi-page example. Pinning min_pixels == max_pixels == our own
+    target leaves the library nothing to recompute: since that target is
+    already a multiple of 112 (hence also of 28), its own rounding is a
+    no-op and the size comes back unchanged.
     """
+    effective_max = max_pixels if max_pixels is not None else IMAGE_MAX_PIXELS
     content = [
         {
             "type": "image", "image": img,
-            "min_pixels": IMAGE_MIN_PIXELS, "max_pixels": IMAGE_MAX_PIXELS,
+            "min_pixels": effective_max, "max_pixels": effective_max,
         }
         for img in images
     ]
