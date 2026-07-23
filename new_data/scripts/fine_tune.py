@@ -46,6 +46,12 @@ from prompt_utils import (
 
 MAX_SEQ_LENGTH = 8192
 MERGE_SIZE = 2  # Qwen2.5-VL vision merger group size (2x2 patches -> 1 token)
+WINDOW_SIZE_PATCHES = 8  # windowed-attention block size in raw 14px patches (112px window)
+# The merge-only check (h,w divisible by MERGE_SIZE=2) isn't sufficient --
+# Qwen2.5-VL's windowed attention needs whole windows of 8x8 raw patches.
+# load_and_resize_image() already rounds to multiples of this, so this
+# check should never actually fire in normal operation; it's a backup
+# in case a resize bug is ever introduced upstream.
 PATCH_NAME_RE = re.compile(r"^([0-9a-f]{32})_(\d+)\.json$")
 
 
@@ -376,10 +382,11 @@ class VRDUQADataset(Dataset):
         if "image_grid_thw" in full_enc:
             for grid in full_enc["image_grid_thw"]:
                 t, h, w = (int(x) for x in grid.tolist())
-                if h % MERGE_SIZE != 0 or w % MERGE_SIZE != 0 or h < MERGE_SIZE or w < MERGE_SIZE:
+                if h % WINDOW_SIZE_PATCHES != 0 or w % WINDOW_SIZE_PATCHES != 0 \
+                        or h < WINDOW_SIZE_PATCHES or w < WINDOW_SIZE_PATCHES:
                     raise ValueError(
                         f"Degenerate image grid (t={t},h={h},w={w}) -- h and w must "
-                        f"each be >= and divisible by MERGE_SIZE={MERGE_SIZE} "
+                        f"each be >= and divisible by WINDOW_SIZE_PATCHES={WINDOW_SIZE_PATCHES} "
                         f"for doc_id={record['doc_id']} page={record.get('page')}"
                     )
 
@@ -636,7 +643,8 @@ class VRDUQATrainer(Trainer):
                 if "image_grid_thw" in inputs:
                     for grid in inputs["image_grid_thw"]:
                         t, h, w = (int(x) for x in grid.tolist())
-                        if h % MERGE_SIZE != 0 or w % MERGE_SIZE != 0 or h < MERGE_SIZE or w < MERGE_SIZE:
+                        if h % WINDOW_SIZE_PATCHES != 0 or w % WINDOW_SIZE_PATCHES != 0 \
+                                or h < WINDOW_SIZE_PATCHES or w < WINDOW_SIZE_PATCHES:
                             raise ValueError(
                                 f"Degenerate image grid (t={t},h={h},w={w}) "
                                 f"for doc_id={record['doc_id']}"
